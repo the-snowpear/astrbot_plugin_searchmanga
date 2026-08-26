@@ -29,8 +29,31 @@ async def fetch_challenge_m(sess: aiohttp.ClientSession, proxy: str | None = Non
 
 
 async def fetch_image_bytes(url: str, timeout: int, proxy: str | None = None) -> bytes:
+    url_clean = url.strip()
+    if url_clean.startswith("data:image/") and ";base64," in url_clean:
+        b64_data = url_clean.split(";base64,", 1)[1]
+        return base64.b64decode(b64_data)
+    if url_clean.startswith("base64://"):
+        return base64.b64decode(url_clean[len("base64://") :])
+    if url_clean.startswith("file://"):
+        file_path = url_clean[len("file://") :]
+        if file_path.startswith("/") and len(file_path) > 3 and file_path[2] == ":":
+            file_path = file_path.lstrip("/")
+        from pathlib import Path
+
+        return Path(file_path).read_bytes()
+
+    from pathlib import Path
+
+    try:
+        local_p = Path(url_clean)
+        if local_p.exists() and local_p.is_file():
+            return local_p.read_bytes()
+    except Exception:
+        pass
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as sess:
-        async with sess.get(url, headers={"User-Agent": DEFAULT_UA}, proxy=proxy) as resp:
+        async with sess.get(url_clean, headers={"User-Agent": DEFAULT_UA}, proxy=proxy) as resp:
             resp.raise_for_status()
             return await resp.read()
 

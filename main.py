@@ -126,24 +126,134 @@ def _normalize_callback_base(value: str) -> str:
     return base
 
 
-def _extract_image_url(event: AstrMessageEvent) -> Optional[str]:
-    """Look at the current message chain first, then the Reply target's chain."""
-    chain = getattr(event.message_obj, "message", None) or []
-    for seg in chain:
-        if isinstance(seg, Comp.Image):
-            url = getattr(seg, "url", None) or getattr(seg, "file", None)
-            if url and isinstance(url, str) and url.startswith("http"):
-                return url
-    for seg in chain:
-        if isinstance(seg, Comp.Reply):
-            reply_chain = getattr(seg, "chain", None) or []
-            for s in reply_chain:
-                if isinstance(s, Comp.Image):
-                    url = getattr(s, "url", None) or getattr(s, "file", None)
-                    if url and isinstance(url, str) and url.startswith("http"):
-                        return url
+def _extract_components_from_event(event: AstrMessageEvent) -> list[Any]:
+    components: list[Any] = []
+    getter = getattr(event, "get_messages", None)
+    if callable(getter):
+        try:
+            res = getter()
+            if isinstance(res, list):
+                components.extend(res)
+        except Exception:
+            pass
+    message_obj = getattr(event, "message_obj", None)
+    if message_obj:
+        chain = getattr(message_obj, "message", None)
+        if isinstance(chain, list):
+            for item in chain:
+                if item not in components:
+                    components.append(item)
+    return components
+
+
+def _extract_image_url_from_component(comp: Any) -> Optional[str]:
+    if isinstance(comp, Comp.Image):
+        url = (
+            getattr(comp, "url", None)
+            or getattr(comp, "file", None)
+            or getattr(comp, "path", None)
+        )
+        if url and isinstance(url, str):
+            return url.strip()
+    elif isinstance(comp, dict):
+        if comp.get("type") == "image":
+            data = comp.get("data")
+            if isinstance(data, dict):
+                url = data.get("url") or data.get("file") or data.get("path")
+                if url and isinstance(url, str):
+                    return url.strip()
+            elif isinstance(comp.get("file"), str):
+                return comp["file"].strip()
     return None
 
+
+def _extract_image_url(event: AstrMessageEvent) -> Optional[str]:
+    """同步提取当前消息中的图片（用于快速记录和回退）"""
+    components = _extract_components_from_event(event)
+    for comp in components:
+        url = _extract_image_url_from_component(comp)
+        if url:
+            return url
+
+    for comp in components:
+        if isinstance(comp, Comp.Reply):
+            for field in ("chain", "message", "content", "origin"):
+                sub_chain = getattr(comp, field, None)
+                if isinstance(sub_chain, list):
+                    for s in sub_chain:
+                        url = _extract_image_url_from_component(s)
+                        if url:
+                            return url
+                elif sub_chain:
+                    url = _extract_image_url_from_component(sub_chain)
+                    if url:
+                        return url
+
+    # 尝试从 raw_message 中解析
+    raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    if raw_message:
+        from .onebot import extract_images_from_onebot_message
+
+        images = extract_images_from_onebot_message(raw_message)
+        if images:
+            return images[0]
+
+    return None
+
+
+async def _resolve_image_url_async(event: AstrMessageEvent) -> Optional[str]:
+    """异步完整提取图片（含 OneBot 引用消息回查）"""
+    # 1. 尝试从本条消息直接提取
+    url = _extract_image_url(event)
+    if url:
+        return url
+
+    # 2. 检查是否有 Reply 组件需要拉取历史消息
+    components = _extract_components_from_event(event)
+    reply_ids: list[str | int] = []
+    for comp in components:
+        if isinstance(comp, Comp.Reply):
+            msg_id = getattr(comp, "id", None) or getattr(comp, "message_id", None)
+            if msg_id:
+                reply_ids.append(msg_id)
+        elif isinstance(comp, dict) and comp.get("type") == "reply":
+            data = comp.get("data")
+            if isinstance(data, dict):
+                msg_id = data.get("id") or data.get("message_id")
+                if msg_id:
+                    reply_ids.append(msg_id)
+
+    # 检查 raw_message 中的 reply 段
+    raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
+    if isinstance(raw_message, dict):
+        raw_reply = raw_message.get("reply")
+        if isinstance(raw_reply, dict):
+            msg_id = raw_reply.get("message_id") or raw_reply.get("id")
+            if msg_id and msg_id not in reply_ids:
+                reply_ids.append(msg_id)
+    elif isinstance(raw_message, list):
+        for seg in raw_message:
+            if isinstance(seg, dict) and seg.get("type") == "reply":
+                data = seg.get("data")
+                if isinstance(data, dict):
+                    msg_id = data.get("id") or data.get("message_id")
+                    if msg_id and msg_id not in reply_ids:
+                        reply_ids.append(msg_id)
+
+    # 3. 对找到的 reply_ids 执行 OneBot get_msg 拉取被引用消息
+    if reply_ids:
+        from .onebot import get_msg, extract_images_from_onebot_message
+
+        for r_id in reply_ids:
+            try:
+                msg_payload = await get_msg(event, r_id)
+                images = extract_images_from_onebot_message(msg_payload)
+                if images:
+                    return images[0]
+            except Exception as exc:
+                logger.debug(f"获取引用消息图片失败: reply_id={r_id}, {exc}")
+
+    return None
 
 def _event_text(event: AstrMessageEvent) -> str:
     getter = getattr(event, "get_message_str", None)
@@ -840,7 +950,11 @@ class SearchMangaPlugin(Star):
             yield event.plain_result("本插件的合并转发仅支持 QQ (aiocqhttp)。")
             return
 
-        image_url = image_url or _extract_image_url(event) or self._recent_image_url(event)
+        image_url = (
+            image_url
+            or await _resolve_image_url_async(event)
+            or self._recent_image_url(event)
+        )
         if not image_url:
             yield event.plain_result(
                 "请发送或回复一张图片后再使用 /搜本子 (也可在同一条消息里附带图片)。"
