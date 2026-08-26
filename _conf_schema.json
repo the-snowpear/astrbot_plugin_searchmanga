@@ -1,0 +1,142 @@
+{
+  "max_results": {
+    "description": "返回结果数量",
+    "type": "int",
+    "hint": "合并转发中展示的条目数，soutubot 通常返回数十条，按相似度降序取前 N 条",
+    "default": 5
+  },
+  "similarity_threshold": {
+    "description": "低相似度警告阈值 (%)",
+    "type": "int",
+    "hint": "低于该值时在条目前加低相似度标记，soutubot 官方前端默认 28",
+    "default": 28
+  },
+  "factor": {
+    "description": "搜索精度参数 factor",
+    "type": "float",
+    "hint": "soutubot 当前前端普通搜索使用 1.2，严格模式使用 1.4；一般保持 1.2 即可",
+    "default": 1.2
+  },
+  "timeout": {
+    "description": "搜索 HTTP 请求超时 (秒)",
+    "type": "int",
+    "default": 60
+  },
+  "node_name": {
+    "description": "合并转发节点昵称",
+    "type": "string",
+    "default": "搜本子"
+  },
+  "node_uin": {
+    "description": "合并转发节点 QQ 号兜底值",
+    "type": "int",
+    "default": 10000
+  },
+  "send_preview_image": {
+    "description": "默认发送搜索结果预览图",
+    "type": "bool",
+    "hint": "开启后，合并转发结果中的每个条目会附带预览图片；关闭后只发送文字信息。可在下方群聊单独设置中为指定群覆盖。",
+    "default": true
+  },
+  "allow_download": {
+    "description": "默认允许下载功能",
+    "type": "bool",
+    "hint": "开启后允许使用下载指令和 LLM 下载工具；关闭后只保留搜图结果展示。可在下方群聊单独设置中为指定群覆盖。",
+    "default": true
+  },
+  "group_settings": {
+    "description": "群聊单独设置",
+    "type": "template_list",
+    "hint": "为不同 QQ 群单独配置合并转发是否带预览图、是否允许下载。未匹配到的群使用上方默认值。",
+    "templates": {
+      "group": {
+        "name": "群聊设置",
+        "items": {
+          "group_id": {
+            "description": "QQ群号",
+            "type": "string",
+            "hint": "填写需要单独配置的群号，例如 123456789。",
+            "default": ""
+          },
+          "send_preview_image": {
+            "description": "合并转发发送预览图",
+            "type": "bool",
+            "default": true
+          },
+          "allow_download": {
+            "description": "允许下载功能",
+            "type": "bool",
+            "default": true
+          }
+        }
+      }
+    },
+    "default": []
+  },
+  "download_concurrency": {
+    "description": "本子图片下载并发数",
+    "type": "int",
+    "hint": "逐页抓图时同时下载的图片数量；过高可能触发站点限流",
+    "default": 4
+  },
+  "download_timeout": {
+    "description": "本子下载总超时 (秒)",
+    "type": "int",
+    "default": 600
+  },
+  "base64_file_limit_mb": {
+    "description": "Base64 直传文件上限 (MB)",
+    "type": "int",
+    "hint": "压缩包不超过该大小时优先使用 OneBot base64:// 直传，AstrBot 与 NapCat 不在同一台机器时也可用；填 0 则禁用，改用 HTTP 回调。",
+    "default": 48
+  },
+  "stream_chunk_kb": {
+    "description": "NapCat 流式上传分片大小 (KB)",
+    "type": "int",
+    "hint": "base64 直传不可用或文件较大时，使用 NapCat upload_file_stream 跨机器传输。一般保持默认即可。",
+    "default": 256
+  },
+  "ehentai_cookie": {
+    "description": "E-Hentai Cookie",
+    "type": "string",
+    "hint": "可选。用于 E-Hentai 归档下载或访问需要登录的内容",
+    "default": ""
+  },
+  "exhentai_cookie": {
+    "description": "ExHentai Cookie",
+    "type": "string",
+    "hint": "可选。用于 ExHentai 归档下载或访问需要登录的内容",
+    "default": ""
+  },
+  "prefer_archive_download": {
+    "description": "优先尝试归档下载",
+    "type": "bool",
+    "hint": "Panda 固定使用归档；E/ExHentai 开启后先尝试 archiver.php，失败再逐页抓图",
+    "default": true
+  },
+  "proxy_enabled": {
+    "description": "启用网络代理",
+    "type": "bool",
+    "hint": "用于解决 nHentai、E-Hentai 等站点 443 直连超时的问题",
+    "default": false
+  },
+  "proxy_policy": {
+    "description": "代理策略",
+    "type": "string",
+    "hint": "disabled=不使用；all=搜索和下载都使用；search_only=仅搜图请求使用；download_only=仅下载请求使用",
+    "options": ["disabled", "all", "search_only", "download_only"],
+    "default": "download_only"
+  },
+  "proxy_url": {
+    "description": "代理地址",
+    "type": "string",
+    "hint": "支持 http/https 代理。未写协议时自动按 http 处理",
+    "default": "http://127.0.0.1:7897"
+  },
+  "file_callback_base": {
+    "description": "文件发送服务地址",
+    "type": "string",
+    "hint": "QQ/OneBot 协议端用于下载 AstrBot 临时文件的 HTTP 地址。留空时优先使用 AstrBot 全局 callback_api_base。AstrBot 和 NapCat 不在同一台服务器时必须填写 NapCat 可访问的 AstrBot 地址，例如 http://AstrBot服务器IP:6185。",
+    "default": ""
+  }
+}

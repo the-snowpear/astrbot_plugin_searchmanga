@@ -1,0 +1,8 @@
+name: astrbot_plugin_searchmanga
+desc: 通过 soutubot.moe 以图搜本子（漫画/同人志反向搜索），支持 /搜本子 指令与 LLM 工具调用，结果以合并转发呈现，并支持本子下载与 OneBot 文件直传。
+short_desc: 以图搜本子（soutubot.moe），支持合并转发与本子下载。
+version: 0.2.0
+author: the_snowpear
+repo: https://github.com/the-snowpear/astrbot_plugin_searchmanga
+support_platforms:
+  - aiocqhttp
