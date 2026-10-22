@@ -12,7 +12,7 @@ import aiohttp
 
 from astrbot.api import AstrBotConfig, logger
 from astrbot.api.event import AstrMessageEvent, filter
-from astrbot.api.star import Context, Star, register
+from astrbot.api.star import Context, Star
 from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 import astrbot.api.message_components as Comp
@@ -287,12 +287,6 @@ def _coerce_bool(value, default: bool) -> bool:
     return default
 
 
-@register(
-    "astrbot_plugin_searchmanga",
-    "the_snowpear",
-    "通过 soutubot.moe 以图搜本子",
-    "0.2.0",
-)
 class SearchMangaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -722,14 +716,14 @@ class SearchMangaPlugin(Star):
     def _node_name(self) -> str:
         return str(self.config.get("node_name", "搜本子"))
 
-    def _node_uin(self, event: AstrMessageEvent) -> int:
+    def _node_uin(self, event: AstrMessageEvent) -> str:
+        # Node.uin 的字段类型是 str | None。AstrBot 在 Python 3.14 上改用
+        # pydantic v2 直接校验消息组件，不再做 int -> str 的隐式转换，
+        # 这里必须显式转成字符串，否则构造合并转发节点时会抛 ValidationError。
         self_id = getattr(event.message_obj, "self_id", None)
-        try:
-            if self_id:
-                return int(self_id)
-        except (TypeError, ValueError):
-            logger.warning(f"无法解析机器人 self_id: {self_id}")
-        return int(self.config.get("node_uin", 10000))
+        if self_id:
+            return str(self_id)
+        return str(self.config.get("node_uin", 10000))
 
     def _session_key(self, event: AstrMessageEvent) -> str:
         return str(getattr(event, "unified_msg_origin", None) or event.get_session_id())

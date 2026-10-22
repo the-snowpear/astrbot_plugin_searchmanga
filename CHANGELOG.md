@@ -4,6 +4,20 @@
 
 ---
 
+## [0.2.1] - 2026-10-22
+
+### 🐛 修复 (Fixed)
+- **Python 3.14 兼容**：`Node.uin` 现在显式转换为 `str`。AstrBot 在 Python 3.14 上使用 pydantic v2 直接校验消息组件，不再做 `int -> str` 隐式转换，原写法会在构造合并转发节点时抛出 `ValidationError`，导致搜索结果与下载提示无法发出（Python 3.12/3.13 因走 pydantic v1 兼容层而未暴露）。
+
+### 🔧 变更 (Changed)
+- 移除已废弃的 `@register(...)` 装饰器，改由 `metadata.yaml` 与 `Star` 基类自动注册，消除启动时的 `DeprecationWarning`。
+- `metadata.yaml` 增加 `display_name`，管理面板展示更直观。
+
+### 📝 文档 (Docs)
+- 新增项目图标与 SVG 视觉素材，重排中英双语文档。
+
+---
+
 ## [0.2.0] - 2025-02-23
 
 ### 🚀 新增特性 (Added)

@@ -1,0 +1,9 @@
+# 图片与压缩包按二进制处理，避免跨平台换行转换损坏文件
+*.png binary
+*.jpg binary
+*.jpeg binary
+*.gif binary
+*.zip binary
+
+# 文档视觉素材统一使用 LF，保证 diff 干净
+*.svg text eol=lf

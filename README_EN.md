@@ -1,18 +1,30 @@
-# astrbot_plugin_searchmanga (Search Doujinshi & Manga)
-
 <div align="center">
-
-[![AstrBot](https://img.shields.io/badge/AstrBot-v3.x+-blue.svg)](https://github.com/AstrBot-Framework/AstrBot)
-[![Version](https://img.shields.io/badge/version-v0.2.0-green.svg)](https://github.com/the-snowpear/astrbot_plugin_searchmanga)
-[![Platform](https://img.shields.io/badge/platform-OneBot%20v11%20%2F%20aiocqhttp-orange.svg)](https://github.com/the-snowpear/astrbot_plugin_searchmanga)
-[![License](https://img.shields.io/badge/license-MIT-informational.svg)](LICENSE)
-
-*An AstrBot plugin for reverse doujinshi/manga image search powered by [soutubot.moe](https://soutubot.moe).*  
-*Features QQ forward message node bundling, automated multi-platform gallery downloading (ZIP packaging), and OneBot cross-machine streaming file uploads.*
-
-[简体中文 (README.md)](README.md) | [English (README_EN.md)](README_EN.md)
-
+  <img src="docs/icon.png" width="128" alt="astrbot_plugin_searchmanga" />
 </div>
+
+<h1 align="center">astrbot_plugin_searchmanga</h1>
+
+<p align="center">
+  <b>Reverse image search for doujinshi</b> · search · forward · download
+</p>
+
+<p align="center">
+  <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-4.x-1f6feb?style=flat-square" alt="AstrBot"></a>
+  <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.2.1-22c55e?style=flat-square" alt="Version"></a>
+  <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8b5cf6?style=flat-square" alt="License"></a>
+  <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga"><img src="https://img.shields.io/badge/platform-aiocqhttp-f97316?style=flat-square" alt="Platform"></a>
+  <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga/stargazers"><img src="https://img.shields.io/github/stars/the-snowpear/astrbot_plugin_searchmanga?style=flat-square&color=f97316&label=stars" alt="Stars"></a>
+  <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga/commits/master"><img src="https://img.shields.io/github/last-commit/the-snowpear/astrbot_plugin_searchmanga?style=flat-square&color=64748b" alt="Last commit"></a>
+</p>
+
+<p align="center">
+  <a href="README.md">简体中文</a> · <a href="README_EN.md">English</a>
+</p>
+
+<img src="docs/banner.en.svg" width="100%" alt="SearchManga banner" />
+
+> An AstrBot plugin for reverse doujinshi / manga search powered by [soutubot.moe](https://soutubot.moe): send an image, get the source as a QQ forward message, and download the whole gallery in one step.
 
 ---
 
@@ -30,6 +42,8 @@
   - [Per-Group Configuration Template](#per-group-configuration-template)
   - [Proxy Strategy Selection](#proxy-strategy-selection)
 - [🤖 LLM Function Calling](#-llm-function-calling)
+- [🧩 Project Structure](#-project-structure)
+- [✅ Compatibility](#-compatibility)
 - [❓ Frequently Asked Questions (FAQ)](#-frequently-asked-questions-faq)
 - [📄 License](#-license)
 
@@ -215,6 +229,38 @@ Native support for AstrBot LLM tool calling:
 
 ---
 
+## 🧩 Project Structure
+
+```text
+astrbot_plugin_searchmanga/
+├── main.py            # Plugin entry: commands, LLM tools, forward messages, download orchestration
+├── soutubot.py        # soutubot.moe client (auth challenge, request wrapper)
+├── downloaders.py     # Per-site gallery fetching and ZIP packaging
+├── onebot.py          # OneBot protocol helpers (forward, reply, file upload)
+├── parsing.py         # URL / text parsing and filename sanitising
+├── models.py          # Data models (SearchEntry / DownloadIntent)
+├── constants.py       # Proxy policy constants
+├── _conf_schema.json  # WebUI configuration schema
+├── metadata.yaml      # Plugin metadata
+├── docs/              # Documentation assets (SVG / icon)
+└── tests/             # Unit tests for parsing and URL generation
+```
+
+---
+
+## ✅ Compatibility
+
+| Item | Status |
+| :--- | :--- |
+| AstrBot | 4.x (APIs checked against **4.29.1**) |
+| Python | 3.12 / 3.13 / **3.14** |
+| Platform | `aiocqhttp` (OneBot v11) |
+| Protocol backend | NapCat / Lagrange and other `send_group_forward_msg` implementations |
+
+> **Fixed in v0.2.1**: AstrBot validates message components with pydantic v2 directly on Python 3.14, which no longer coerces `int -> str`. Passing an integer as `Node.uin` raised a `ValidationError` while building forward-message nodes, so results could not be delivered. The value is now converted to `str` explicitly. See [CHANGELOG](CHANGELOG.md).
+
+---
+
 ## ❓ Frequently Asked Questions (FAQ)
 
 #### Q1: Search fails with `soutubot 对代理敏感` (soutubot is sensitive to proxies)?
@@ -227,6 +273,9 @@ Native support for AstrBot LLM tool calling:
 
 #### Q3: ExHentai download returns 403 or fails to parse?
 **Answer**: ExHentai requires valid login cookies. Set `exhentai_cookie` in the plugin configuration (must include `ipb_member_id`, `ipb_pass_hash`, `igneous`, etc.).
+
+#### Q4: Forward messages stopped working after upgrading to Python 3.14?
+**Answer**: This is a known issue in v0.2.0 caused by stricter pydantic v2 validation of `Node.uin`. Upgrade to **v0.2.1**.
 
 ---
 
