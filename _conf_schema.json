@@ -133,6 +133,31 @@
     "hint": "支持 http/https 代理。未写协议时自动按 http 处理",
     "default": "http://127.0.0.1:7897"
   },
+  "source_proxies": {
+    "description": "按来源单独配置代理",
+    "type": "template_list",
+    "hint": "列表内的来源优先使用其指定代理；“代理地址”留空或填 direct 表示该来源强制直连。列表未列出的来源回退到上面的默认代理设置。来源可选：soutubot（搜图）、nhentai、ehentai、exhentai、panda、jmcomic（下载）。",
+    "templates": {
+      "source": {
+        "name": "来源代理",
+        "items": {
+          "source": {
+            "description": "来源",
+            "type": "string",
+            "hint": "soutubot / nhentai / ehentai / exhentai / panda / jmcomic",
+            "default": "soutubot"
+          },
+          "proxy_url": {
+            "description": "代理地址",
+            "type": "string",
+            "hint": "如 http://172.18.0.1:7890；留空或填 direct 表示强制直连",
+            "default": ""
+          }
+        }
+      }
+    },
+    "default": []
+  },
   "file_callback_base": {
     "description": "文件发送服务地址",
     "type": "string",

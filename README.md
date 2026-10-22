@@ -170,7 +170,8 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | `prefer_archive_download` | `bool` | `true` | 是否优先尝试归档直下 |
 | `proxy_enabled` | `bool` | `false` | 是否开启网络代理 |
 | `proxy_policy` | `string` | `"download_only"` | 代理作用范围策略（见下文） |
-| `proxy_url` | `string` | `"http://127.0.0.1:7897"` | 代理地址（HTTP / HTTPS / SOCKS5） |
+| `proxy_url` | `string` | `"http://127.0.0.1:7897"` | 代理地址（HTTP / HTTPS） |
+| `source_proxies` | `list` | `[]` | 按来源单独配置代理，列表内优先于全局代理 |
 | `file_callback_base` | `string` | `""` | 协议端访问 AstrBot 文件的基础 URL（如 `http://192.168.1.100:6185`） |
 | `group_settings` | `list` | `[]` | 群聊个性化独立设置列表 |
 
@@ -197,6 +198,26 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 - `download_only`（**推荐**）：仅下载图片时走代理，**搜图请求直连**，避免 soutubot 对代理 IP 拦截触发 403 / Cloudflare 校验。
 - `search_only`：仅搜图请求走代理。
 - `all`：搜图与下载全部走代理。
+
+### 按来源单独配置代理
+
+`soutubot` 在 Cloudflare 后方，机房 IP 常被挑战页拦截，而画册站点往往能直连——两者对代理的需求经常相反。`source_proxies` 允许为每个来源单独指定代理：
+
+```json
+[
+  { "source": "soutubot", "proxy_url": "http://172.18.0.1:7890" },
+  { "source": "nhentai",  "proxy_url": "direct" }
+]
+```
+
+优先级与规则：
+
+1. **列表内配置优先**：命中 `source` 的条目直接使用其 `proxy_url`，不再看全局设置。
+2. **列表内写 `direct`（或留空）**：该来源强制直连，即使全局代理已开启。
+3. **列表未命中的来源**：回退到上方的 `proxy_enabled` / `proxy_policy` / `proxy_url`。
+4. **什么都没配置**：全部直连，行为与之前一致。
+
+可用的 `source`：`soutubot`（搜图）、`nhentai`、`ehentai`、`exhentai`、`panda`、`jmcomic`（下载）。
 
 ---
 
@@ -248,7 +269,9 @@ astrbot_plugin_searchmanga/
 | 平台 | `aiocqhttp`（OneBot v11） |
 | 协议端 | NapCat / Lagrange 等支持 `send_group_forward_msg` 的实现 |
 
-> **v0.2.1 修复**：AstrBot 在 Python 3.14 上改用 pydantic v2 直接校验消息组件，不再做 `int -> str` 隐式转换。此前 `Node.uin` 传入整数会在构造合并转发节点时抛 `ValidationError`，导致搜索结果发不出去；现已显式转换为字符串。详见 [CHANGELOG](CHANGELOG.md)。
+> **v0.2.1 修复**：AstrBot 在 Python 3.14 上改用 pydantic v2 直接校验消息组件，不再做 `int -> str` 隐式转换。此前 `Node.uin` 传入整数会在构造合并转发节点时抛 `ValidationError`，导致搜索结果发不出去；现已显式转换为字符串。
+>
+> **v0.2.2 适配**：soutubot 已升级到 v2 检索接口（取消首页 `m` 挑战参数与 `X-API-KEY`，直接 `POST /api/search` 并返回 `results`），插件已同步改写，旧的「无法解析鉴权参数 m」报错随之消失。详见 [CHANGELOG](CHANGELOG.md)。
 
 ---
 

@@ -180,7 +180,8 @@ Configure these settings in the AstrBot WebUI under **Plugin Configuration**:
 | `prefer_archive_download`| `bool` | `true` | Whether to prioritize direct archive downloads for E/ExHentai. |
 | `proxy_enabled` | `bool` | `false` | Enable HTTP/SOCKS proxy. |
 | `proxy_policy` | `string`| `"download_only"` | Proxy scope policy (see below). |
-| `proxy_url` | `string`| `"http://127.0.0.1:7897"`| Proxy address (supports HTTP/HTTPS/SOCKS5). |
+| `proxy_url` | `string`| `"http://127.0.0.1:7897"`| Proxy address (HTTP / HTTPS). |
+| `source_proxies` | `list` | `[]` | Per-source proxy overrides; entries take precedence over the global proxy. |
 | `file_callback_base` | `string`| `""` | Base URL for OneBot client to access AstrBot files (e.g., `http://192.168.1.100:6185`). |
 | `group_settings` | `list` | `[]` | Per-group overrides for preview images and download permissions. |
 
@@ -208,6 +209,26 @@ Override settings for specific QQ groups:
 - `download_only` (**Recommended**): Only use proxy for downloading images from nHentai / E-Hentai. **Search requests bypass proxy** (avoids Cloudflare/IP blocks from soutubot).
 - `search_only`: Only search requests use proxy.
 - `all`: Both search and download use proxy.
+
+### Per-Source Proxy Overrides
+
+`soutubot` sits behind Cloudflare and frequently challenges datacenter IPs, while gallery sites are often reachable directly — the two need opposite proxy setups. `source_proxies` lets you route each source independently:
+
+```json
+[
+  { "source": "soutubot", "proxy_url": "http://172.18.0.1:7890" },
+  { "source": "nhentai",  "proxy_url": "direct" }
+]
+```
+
+Precedence:
+
+1. A matching entry in the list always wins and overrides the global proxy settings.
+2. An empty `proxy_url` (or `direct`) forces that source to bypass the proxy, even when the global proxy is enabled.
+3. Sources not listed fall back to `proxy_enabled` / `proxy_policy` / `proxy_url`.
+4. With nothing configured, every request goes direct — same as before.
+
+Valid `source` values: `soutubot` (search), `nhentai`, `ehentai`, `exhentai`, `panda`, `jmcomic` (download).
 
 ---
 
@@ -257,7 +278,9 @@ astrbot_plugin_searchmanga/
 | Platform | `aiocqhttp` (OneBot v11) |
 | Protocol backend | NapCat / Lagrange and other `send_group_forward_msg` implementations |
 
-> **Fixed in v0.2.1**: AstrBot validates message components with pydantic v2 directly on Python 3.14, which no longer coerces `int -> str`. Passing an integer as `Node.uin` raised a `ValidationError` while building forward-message nodes, so results could not be delivered. The value is now converted to `str` explicitly. See [CHANGELOG](CHANGELOG.md).
+> **Fixed in v0.2.1**: AstrBot validates message components with pydantic v2 directly on Python 3.14, which no longer coerces `int -> str`. Passing an integer as `Node.uin` raised a `ValidationError` while building forward-message nodes, so results could not be delivered. The value is now converted to `str` explicitly.
+>
+> **Adapted in v0.2.2**: soutubot switched to its v2 search API (no homepage `m` challenge and no `X-API-KEY`; a plain `POST /api/search` returns `results`). The plugin was updated accordingly, so the old "cannot parse auth parameter m" error is gone. See [CHANGELOG](CHANGELOG.md).
 
 ---
 

@@ -54,6 +54,17 @@ DEFAULT_STREAM_CHUNK_KB = 256
 STREAM_FILE_RETENTION_MS = 5 * 60 * 1000
 ZIP_MAGIC_PREFIXES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 GROUP_SETTING_TEMPLATE_KEY = "group"
+PROXY_SOURCE_SOUTUBOT = "soutubot"
+# source_proxies 中 proxy_url 填这些值表示“该来源强制直连”，用于覆盖默认代理。
+DIRECT_PROXY_TOKENS = {"", "direct", "none", "off", "disabled", "no"}
+_PROXY_UNSET = object()
+
+
+def _normalize_proxy_url(raw) -> str:
+    url = str(raw or "").strip()
+    if url and "://" not in url:
+        url = f"http://{url}"
+    return url
 
 
 def _assert_valid_zip(path: Path) -> None:
@@ -489,12 +500,43 @@ class SearchMangaPlugin(Star):
         return policy if policy in valid else PROXY_POLICY_DOWNLOAD_ONLY
 
     def _proxy_url(self) -> str:
-        url = str(self.config.get("proxy_url", "http://127.0.0.1:7897") or "").strip()
-        if url and "://" not in url:
-            url = f"http://{url}"
-        return url
+        return _normalize_proxy_url(self.config.get("proxy_url", "http://127.0.0.1:7897"))
 
-    def _proxy_for(self, phase: str) -> str | None:
+    def _source_proxy_map(self) -> dict[str, str]:
+        """解析 source_proxies 列表，返回 {来源: 代理地址}。
+
+        值为空字符串表示“该来源强制直连”，用于在开启全局代理时单独放行某个源。
+        """
+        entries = self.config.get("source_proxies", [])
+        mapping: dict[str, str] = {}
+        if not isinstance(entries, list):
+            return mapping
+        for entry in entries:
+            if not isinstance(entry, dict):
+                continue
+            source = str(entry.get("source", "") or "").strip().lower()
+            if not source:
+                continue
+            raw = str(entry.get("proxy_url", "") or "").strip()
+            mapping[source] = (
+                "" if raw.lower() in DIRECT_PROXY_TOKENS else _normalize_proxy_url(raw)
+            )
+        return mapping
+
+    def _proxy_for(self, phase: str, source: str | None = None) -> str | None:
+        """返回某个阶段/来源应使用的代理，None 表示直连。
+
+        优先级：
+        1. ``source_proxies`` 列表中为 ``source`` 显式配置的代理（含“强制直连”）；
+        2. 列表未命中时，回退到 ``proxy_enabled`` + ``proxy_policy`` + ``proxy_url``；
+        3. 两者都没配置则直连。
+        """
+        override = self._source_proxy_map().get(
+            (source or "").strip().lower(), _PROXY_UNSET
+        )
+        if override is not _PROXY_UNSET:
+            return override or None
+
         if not self._proxy_enabled():
             return None
         proxy_url = self._proxy_url()
@@ -899,7 +941,7 @@ class SearchMangaPlugin(Star):
                 ehentai_cookie=self._ehentai_cookie(),
                 exhentai_cookie=self._exhentai_cookie(),
                 prefer_archive=self._prefer_archive_download(),
-                proxy=self._proxy_for("download"),
+                proxy=self._proxy_for("download", target.source),
             )
         except asyncio.TimeoutError:
             yield event.plain_result("下载超时，请稍后重试或调大 download_timeout。").stop_event()
@@ -959,7 +1001,7 @@ class SearchMangaPlugin(Star):
             yield event.plain_result("好的，我去找找这个本子")
 
         try:
-            search_proxy = self._proxy_for("search")
+            search_proxy = self._proxy_for("search", PROXY_SOURCE_SOUTUBOT)
             img_bytes = await fetch_image_bytes(image_url, self._timeout(), proxy=search_proxy)
         except Exception as e:
             logger.exception("下载图片失败")
@@ -971,7 +1013,7 @@ class SearchMangaPlugin(Star):
                 img_bytes,
                 self._factor(),
                 self._timeout(),
-                proxy=self._proxy_for("search"),
+                proxy=self._proxy_for("search", PROXY_SOURCE_SOUTUBOT),
             )
         except asyncio.TimeoutError:
             yield event.plain_result("soutubot 请求超时，请稍后重试。")
@@ -979,7 +1021,9 @@ class SearchMangaPlugin(Star):
         except Exception as e:
             logger.exception("soutubot 搜索失败")
             yield event.plain_result(
-                f"搜索失败: {e}\n提示: soutubot 对代理敏感，请确认机器人未走代理。"
+                f"搜索失败: {e}\n"
+                "提示: soutubot 位于 Cloudflare 后方，机房 IP 常被挑战页拦截，"
+                "建议为搜图单独配置代理（proxy_policy=search_only）。"
             )
             return
 
