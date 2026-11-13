@@ -18,7 +18,9 @@ def _ensure_astrbot_stubs() -> None:
         comp_mod = sys.modules.get("astrbot.api.message_components")
         if comp_mod is not None:
             class _BaseComp:
-                def __init__(self, **kwargs):
+                def __init__(self, *args, **kwargs):
+                    if args:
+                        self.nodes = args[0]
                     for k, v in kwargs.items():
                         setattr(self, k, v)
 
@@ -32,11 +34,18 @@ def _ensure_astrbot_stubs() -> None:
                     return cls(file=path, path=path)
 
             for attr in ("Forward", "Node", "Nodes", "File", "Json"):
-                if not hasattr(comp_mod, attr):
+                existing = getattr(comp_mod, attr, None)
+                if existing is None or not isinstance(existing, type):
                     setattr(comp_mod, attr, _BaseComp)
             for attr in ("Image", "Video"):
-                if not hasattr(comp_mod, attr):
+                existing = getattr(comp_mod, attr, None)
+                if existing is None or not isinstance(existing, type):
                     setattr(comp_mod, attr, _MediaComp)
+                else:
+                    if not hasattr(existing, "fromURL"):
+                        existing.fromURL = classmethod(lambda cls, url: cls(url=url, file=url))
+                    if not hasattr(existing, "fromFileSystem"):
+                        existing.fromFileSystem = classmethod(lambda cls, path: cls(file=path, path=path))
         return
 
     astrbot_mod = types.ModuleType("astrbot")
@@ -114,7 +123,8 @@ def _ensure_astrbot_stubs() -> None:
         pass
 
     class _Nodes(_BaseComp):
-        pass
+        def __init__(self, nodes=None, **kwargs):
+            super().__init__(nodes=nodes, **kwargs)
 
     class _File(_BaseComp):
         pass
@@ -792,6 +802,151 @@ class TestRefactorSuite(unittest.TestCase):
             img1.unlink(missing_ok=True)
             img2.unlink(missing_ok=True)
             tmp_dir.rmdir()
+
+    def test_search_manga_nsfw_policy_send_blur_ignore_and_no_leak(self):
+        self.assertIsNone(packaging.try_blur_image_bytes(b"<html>not image</html>"))
+        self.assertEqual(packaging.blur_image_bytes(b"<html>not image</html>"), b"<html>not image</html>")
+
+        plugin = main_mod.SearchMangaPlugin(
+            context=object(),
+            config={
+                "nsfw_policy": "send",
+                "nsfw_group_settings": [
+                    {"group_id": "123456", "nsfw_policy": "blur"},
+                    {"group_id": "654321", "nsfw_policy": "ignore"},
+                ],
+                "send_preview_image": True,
+                "max_results": 3,
+                "proxy_enabled": True,
+                "proxy_policy": "search_only",
+                "proxy_url": "http://127.0.0.1:7897",
+            },
+        )
+        entries = [
+            main_mod.SearchEntry(
+                index=1,
+                title="Work 1",
+                source="nhentai",
+                url="https://nhentai.net/g/111/",
+                similarity=95.5,
+                preview_url="https://soutubot.moe/thumb/1.jpg",
+            ),
+            main_mod.SearchEntry(
+                index=2,
+                title="Work 2",
+                source="jmcomic",
+                url="https://18comic.vip/album/222/",
+                similarity=90.0,
+                preview_url="https://cdn-msp.18comic.vip/thumb/2.jpg",
+            ),
+        ]
+        search_payload = {
+            "data": [
+                {
+                    "title": "Work 1",
+                    "source": "nhentai",
+                    "pagePath": "/g/111/",
+                    "similarity": 95.5,
+                    "previewImageUrl": "https://soutubot.moe/thumb/1.jpg",
+                },
+                {
+                    "title": "Work 2",
+                    "source": "jmcomic",
+                    "pagePath": "/album/222",
+                    "similarity": 90.0,
+                    "previewImageUrl": "https://cdn-msp.18comic.vip/thumb/2.jpg",
+                },
+            ]
+        }
+        # Test _build_forward_nodes fallback safety when blurred_paths omits an entry
+        nodes_blur_empty = plugin._build_forward_nodes(
+            _DummyEvent(group_id="123456"), entries
+        )
+        for node in nodes_blur_empty[1:]:
+            imgs = [c for c in node.content if isinstance(c, Comp.Image)]
+            self.assertEqual(imgs, [])
+
+        raw_query = _make_png_bytes((20, 40, 60))
+        raw_thumb1 = _make_png_bytes((240, 20, 20), size=(80, 80))
+        fetched_urls: list[str] = []
+
+        async def _fake_fetch(url: str, timeout: int, proxy=None):
+            fetched_urls.append(url)
+            if url == "https://example.com/query.png":
+                return raw_query
+            if url == "https://soutubot.moe/thumb/1.jpg":
+                return raw_thumb1
+            raise RuntimeError("thumb fetch failed")
+
+        async def _run():
+            with (
+                patch.object(main_mod, "fetch_image_bytes", side_effect=_fake_fetch),
+                patch.object(main_mod, "search_soutubot", new=AsyncMock(return_value=search_payload)),
+            ):
+                # 1. Default send: uses remote URLs without downloading thumbnails
+                fetched_urls.clear()
+                res_send = [
+                    r async for r in plugin._do_search(
+                        _DummyEvent(group_id="999999"),
+                        "https://example.com/query.png",
+                        send_start_notice=False,
+                    )
+                ]
+                self.assertEqual(fetched_urls, ["https://example.com/query.png"])
+                nodes_send = res_send[0].payload[0].nodes
+                img1 = [c for c in nodes_send[1].content if isinstance(c, Comp.Image)][0]
+                img2 = [c for c in nodes_send[2].content if isinstance(c, Comp.Image)][0]
+                self.assertEqual(img1.url, "https://soutubot.moe/thumb/1.jpg")
+                self.assertEqual(img2.url, "https://cdn-msp.18comic.vip/thumb/2.jpg")
+
+                # 2. Ignore group: hides all preview images without fetching thumbnails
+                fetched_urls.clear()
+                res_ignore = [
+                    r async for r in plugin._do_search(
+                        _DummyEvent(group_id="654321"),
+                        "https://example.com/query.png",
+                        send_start_notice=False,
+                    )
+                ]
+                self.assertEqual(fetched_urls, ["https://example.com/query.png"])
+                nodes_ignore = res_ignore[0].payload[0].nodes
+                for n in nodes_ignore[1:]:
+                    self.assertEqual([c for c in n.content if isinstance(c, Comp.Image)], [])
+
+                # 3. Blur group: downloads & blurs thumb 1 locally, omits failed thumb 2, cleans up temp files
+                fetched_urls.clear()
+                seen_blur_paths: list[Path] = []
+                async for r in plugin._do_search(
+                    _DummyEvent(group_id="123456"),
+                    "https://example.com/query.png",
+                    send_start_notice=False,
+                ):
+                    nodes_blur = r.payload[0].nodes
+                    imgs_n1 = [c for c in nodes_blur[1].content if isinstance(c, Comp.Image)]
+                    imgs_n2 = [c for c in nodes_blur[2].content if isinstance(c, Comp.Image)]
+                    self.assertEqual(len(imgs_n1), 1)
+                    self.assertEqual(len(imgs_n2), 0)
+                    blur_path = Path(imgs_n1[0].path)
+                    seen_blur_paths.append(blur_path)
+                    self.assertTrue(blur_path.exists())
+                    self.assertIsNone(getattr(imgs_n1[0], "url", None))
+                    blurred_bytes = blur_path.read_bytes()
+                    self.assertNotEqual(blurred_bytes, raw_thumb1)
+                    with Image.open(BytesIO(blurred_bytes)) as im:
+                        self.assertEqual(im.size, (80, 80))
+
+                self.assertEqual(
+                    set(fetched_urls),
+                    {
+                        "https://example.com/query.png",
+                        "https://soutubot.moe/thumb/1.jpg",
+                        "https://cdn-msp.18comic.vip/thumb/2.jpg",
+                    },
+                )
+                self.assertEqual(len(seen_blur_paths), 1)
+                self.assertFalse(seen_blur_paths[0].exists())
+
+        asyncio.run(_run())
 
 
 if __name__ == "__main__":

@@ -141,8 +141,10 @@ def verify_image_bytes(data: bytes) -> str:
     return "jpg"
 
 
-def blur_image_bytes(data: bytes, radius: int = 20) -> bytes:
-    """对图片字节施加高斯模糊；Pillow 不可用时原样返回。"""
+def try_blur_image_bytes(data: bytes, radius: int = 20) -> bytes | None:
+    """对图片字节施加高斯模糊；Pillow 不可用或图片解码失败时返回 None。"""
+    if not data:
+        return None
     try:
         from PIL import Image, ImageFilter
 
@@ -153,7 +155,13 @@ def blur_image_bytes(data: bytes, radius: int = 20) -> bytes:
             blurred.save(out, format="JPEG", quality=85)
             return out.getvalue()
     except Exception:
-        return data
+        return None
+
+
+def blur_image_bytes(data: bytes, radius: int = 20) -> bytes:
+    """对图片字节施加高斯模糊；Pillow 不可用时原样返回。"""
+    blurred = try_blur_image_bytes(data, radius=radius)
+    return blurred if blurred is not None else data
 
 
 def blur_image_file(image_path: Path, radius: int = 20) -> Path:

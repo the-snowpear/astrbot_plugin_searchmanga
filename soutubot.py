@@ -2,6 +2,7 @@ import base64
 import json
 from pathlib import Path
 from typing import Any
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -296,8 +297,16 @@ async def fetch_image_bytes(url: str, timeout: int, proxy: str | None = None) ->
     except Exception:
         pass
 
+    headers = {
+        "User-Agent": DEFAULT_UA,
+        "Accept": "image/avif,image/webp,image/png,image/jpeg,*/*;q=0.8",
+    }
+    host = (urlparse(url_clean).hostname or "").lower()
+    if host == "soutubot.moe" or host.endswith(".soutubot.moe"):
+        headers["Referer"] = f"{SOUTUBOT_BASE}/"
+
     async with aiohttp.ClientSession(timeout=aiohttp.ClientTimeout(total=timeout)) as sess:
-        async with sess.get(url_clean, headers={"User-Agent": DEFAULT_UA}, proxy=proxy) as resp:
+        async with sess.get(url_clean, headers=headers, proxy=proxy) as resp:
             resp.raise_for_status()
             return await resp.read()
 

@@ -9,7 +9,7 @@
 ### 🚀 新增特性 (Added)
 - **链接解析管线**（参考 `Zhalstar/astrbot_plugin_parser` 的 MIT 设计）：支持自动解析消息/QQ JSON 卡片中的 JMComic、E-Hentai、ExHentai、nHentai、Iwara（视频与图集）、Panda 链接与单独 JM 号，支持群聊白名单/黑名单、同会话防抖冷却（`parse_debounce_seconds`）与多 Bot 表情仲裁（`parse_arbiter`）。
 - **新增指令与 LLM 工具**：`/解析`（别名 `/jx`、`/parse`，支持附带链接或引用含链接/转发的消息）、`/开启解析`、`/关闭解析` 与 LLM 工具 `parse_media_url`。
-- **多格式输出与安全策略**：支持配置 `output_format`（`zip` / `pdf` / `merge`）、`preview_count`、`max_pages`（超页自动跳过全本）、全局默认 `nsfw_policy`（`send` / `blur` / `ignore`）+ 按群独立覆盖列表 `nsfw_group_settings`，以及 Pillow 可视化信息卡片渲染（`render_parse_card`）。
+- **多格式输出与安全策略**：支持配置 `output_format`（`zip` / `pdf` / `merge`）、`preview_count`、`max_pages`（超页自动跳过全本）、全局默认 `nsfw_policy`（`send` / `blur` / `ignore`）+ 按群独立覆盖列表 `nsfw_group_settings`（同时作用于 `/搜本子` 搜索结果预览图与链接解析封面/预览），以及 Pillow 可视化信息卡片渲染（`render_parse_card`）。
 - **模块化服务架构**：拆分为 `jm_service.py`、`ehentai_service.py`、`nhentai_service.py`、`iwara_service.py`、`packaging.py` 与统一分发 `downloaders.py`。
 
 ### 🐛 修复 (Fixed)

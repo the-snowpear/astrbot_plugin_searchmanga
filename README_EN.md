@@ -191,8 +191,8 @@ Configure these settings in the AstrBot WebUI under **Plugin Configuration**:
 | `output_format` | `string` | `"zip"` | Output format: `zip`, `pdf`, or `merge` (info card + preview forward). |
 | `preview_count` | `int` | `3` | Maximum preview pages attached in `merge` mode. |
 | `max_pages` | `int` | `200` | Maximum page limit for full downloads (`0` for unlimited). |
-| `nsfw_policy` | `string` | `"send"` | Global default R18 cover/preview handling: `send`, `blur`, or `ignore`. |
-| `nsfw_group_settings` | `list` | `[]` | Per-group overrides for `nsfw_policy`; listed groups override the global default. |
+| `nsfw_policy` | `string` | `"send"` | Global default R18 cover/preview handling (both `/搜本子` search previews & link parser): `send`, `blur`, or `ignore`. |
+| `nsfw_group_settings` | `list` | `[]` | Per-group overrides for `nsfw_policy` (both `/搜本子` & link parser); listed groups override the global default. |
 | `render_parse_card` | `bool` | `true` | Render Pillow visual info cards for parse results. |
 | `parse_arbiter` | `bool` | `true` | Multi-bot group reaction arbiter to avoid duplicate replies. |
 | `parse_debounce_seconds` | `int` | `10` | Per-session cooldown in seconds for repeated identical targets. |

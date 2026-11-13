@@ -222,7 +222,7 @@
   "nsfw_policy": {
     "description": "默认 R18 / NSFW 封面与预览图处理策略",
     "type": "string",
-    "hint": "send=正常发送；blur=高斯模糊处理后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 内容则直接忽略）。可在下方列表中为指定群单独覆盖。",
+    "hint": "同时作用于 /搜本子 预览图与链接解析封面/预览：send=正常发送；blur=高斯模糊后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 内容则直接忽略）。可在下方列表中为指定群单独覆盖。",
     "options": ["send", "blur", "ignore"],
     "default": "send"
   },
@@ -243,7 +243,7 @@
           "nsfw_policy": {
             "description": "NSFW 处理策略",
             "type": "string",
-            "hint": "send=正常发送；blur=高斯模糊后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 直接忽略）",
+            "hint": "同时作用于 /搜本子 预览图与链接解析：send=正常发送；blur=高斯模糊后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 直接忽略）",
             "options": ["send", "blur", "ignore"],
             "default": "blur"
           }

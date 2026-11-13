@@ -181,8 +181,8 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | `output_format` | `string` | `"zip"` | 下载与解析输出格式：`zip` / `pdf` / `merge`（卡片+预览图合并转发） |
 | `preview_count` | `int` | `3` | `merge` 模式展示的最大预览页数 |
 | `max_pages` | `int` | `200` | 单本下载页数上限（超过则只发元数据卡片，0 为不限制） |
-| `nsfw_policy` | `string` | `"send"` | 全局默认 NSFW/Ecchi 封面与预览策略：`send` / `blur`（高斯模糊） / `ignore` |
-| `nsfw_group_settings` | `list` | `[]` | 按群单独配置 `nsfw_policy`；命中列表的群优先覆盖全局默认策略 |
+| `nsfw_policy` | `string` | `"send"` | 全局默认 NSFW/Ecchi 封面与预览策略（含 `/搜本子` 预览图与链接解析）：`send` / `blur`（高斯模糊） / `ignore` |
+| `nsfw_group_settings` | `list` | `[]` | 按群单独配置 `nsfw_policy`（同时作用于 `/搜本子` 与链接解析）；命中列表的群优先覆盖全局默认策略 |
 | `render_parse_card` | `bool` | `true` | 是否渲染可视化解析信息卡片 |
 | `parse_arbiter` | `bool` | `true` | 群聊多 Bot 表情仲裁，避免重复刷屏 |
 | `parse_debounce_seconds` | `int` | `10` | 同会话相同目标防抖冷却（秒） |

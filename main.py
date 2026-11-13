@@ -7,6 +7,7 @@ import uuid
 import zipfile
 from pathlib import Path
 from typing import Any, Optional
+from urllib.parse import urlparse
 
 import aiohttp
 
@@ -18,6 +19,8 @@ from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 import astrbot.api.message_components as Comp
 
 from .constants import (
+    NSFW_POLICY_BLUR,
+    NSFW_POLICY_IGNORE,
     NSFW_POLICY_SEND,
     OUTPUT_FORMAT_MERGE,
     OUTPUT_FORMAT_PDF,
@@ -41,7 +44,7 @@ from .onebot import (
     get_msg,
     iter_reply_components,
 )
-from .packaging import apply_nsfw_to_cover, render_info_card, temp_root
+from .packaging import apply_nsfw_to_cover, render_info_card, temp_root, try_blur_image_bytes
 from .parsing import (
     extract_json_url,
     extract_parse_targets,
@@ -919,9 +922,77 @@ class SearchMangaPlugin(Star):
                     return entry
         return None
 
-    def _build_forward_nodes(self, event: AstrMessageEvent, entries: list[SearchEntry]) -> list[Comp.Node]:
+    def _search_preview_proxy(self, preview_url: str, entry_source: str) -> str | None:
+        host = (urlparse(preview_url).hostname or "").lower()
+        if host == "soutubot.moe" or host.endswith(".soutubot.moe"):
+            source = PROXY_SOURCE_SOUTUBOT
+        else:
+            source = source_from_url(preview_url) or entry_source or PROXY_SOURCE_SOUTUBOT
+        return self._proxy_for("search", source)
+
+    async def _prepare_blurred_search_previews(
+        self,
+        entries: list[SearchEntry],
+    ) -> dict[int, Path]:
+        """并发拉取 /搜本子 预览缩略图并做高斯模糊，失败时宁可隐藏也不回退原图。"""
+        targets = [entry for entry in entries if entry.preview_url]
+        if not targets:
+            return {}
+
+        sem = asyncio.Semaphore(4)
+        blurred_paths: dict[int, Path] = {}
+
+        async def _worker(entry: SearchEntry) -> None:
+            proxy = self._search_preview_proxy(entry.preview_url, entry.source)
+            async with sem:
+                raw = await fetch_image_bytes(
+                    entry.preview_url,
+                    self._timeout(),
+                    proxy=proxy,
+                )
+            blurred = try_blur_image_bytes(raw)
+            if not blurred:
+                logger.warning(
+                    f"[搜本子] 预览图模糊处理失败（缺少 Pillow 或图片无效），已隐藏该条预览图: #{entry.index}"
+                )
+                return
+            dest = temp_root() / f"search_blur_{uuid.uuid4().hex[:8]}.jpg"
+            try:
+                dest.write_bytes(blurred)
+                blurred_paths[entry.index] = dest
+            except OSError:
+                dest.unlink(missing_ok=True)
+                raise
+
+        try:
+            results = await asyncio.gather(
+                *(_worker(entry) for entry in targets),
+                return_exceptions=True,
+            )
+        except BaseException:
+            for p in blurred_paths.values():
+                p.unlink(missing_ok=True)
+            raise
+
+        for entry, result in zip(targets, results):
+            if isinstance(result, Exception):
+                logger.warning(
+                    f"[搜本子] 预览图拉取/模糊失败，已隐藏该条预览图 (#{entry.index}): {result}"
+                )
+        return blurred_paths
+
+    def _build_forward_nodes(
+        self,
+        event: AstrMessageEvent,
+        entries: list[SearchEntry],
+        *,
+        nsfw_policy: str | None = None,
+        blurred_paths: dict[int, Path] | None = None,
+    ) -> list[Comp.Node]:
         threshold = self._threshold()
         node_uin = self._node_uin(event)
+        send_preview = self._send_preview_image(event)
+        policy = nsfw_policy if nsfw_policy is not None else self._nsfw_policy(event)
         intro_text = f"找到了 {len(entries)} 条结果。"
         if self._allow_download(event):
             intro_text += "引用这条合并消息回复「下载第1个」，或直接发送「/下载本子 1」就能下载。"
@@ -951,8 +1022,13 @@ class SearchMangaPlugin(Star):
             if extra_links:
                 text += f"\n备用: {extra_links[0]}"
             content: list = []
-            if self._send_preview_image(event) and entry.preview_url:
-                content.append(Comp.Image.fromURL(entry.preview_url))
+            if send_preview and entry.preview_url and policy != NSFW_POLICY_IGNORE:
+                if policy == NSFW_POLICY_BLUR:
+                    blurred_path = (blurred_paths or {}).get(entry.index)
+                    if blurred_path:
+                        content.append(Comp.Image.fromFileSystem(str(blurred_path)))
+                else:
+                    content.append(Comp.Image.fromURL(entry.preview_url))
             content.append(Comp.Plain(text))
             nodes.append(Comp.Node(uin=node_uin, name=self._node_name(), content=content))
         return nodes
@@ -1455,9 +1531,26 @@ class SearchMangaPlugin(Star):
             for idx, item in enumerate(data[: self._max_results()], 1)
         ]
         self._remember_search(event, entries)
-        yield event.chain_result([Comp.Nodes(self._build_forward_nodes(event, entries))])
-        if stop_agent_after_result:
-            event.set_extra("agent_stop_requested", True)
+        nsfw_policy = self._nsfw_policy(event)
+        blurred_paths: dict[int, Path] = {}
+        try:
+            if self._send_preview_image(event) and nsfw_policy == NSFW_POLICY_BLUR:
+                blurred_paths = await self._prepare_blurred_search_previews(entries)
+            nodes = self._build_forward_nodes(
+                event,
+                entries,
+                nsfw_policy=nsfw_policy,
+                blurred_paths=blurred_paths,
+            )
+            yield event.chain_result([Comp.Nodes(nodes)])
+            if stop_agent_after_result:
+                event.set_extra("agent_stop_requested", True)
+        finally:
+            for p in blurred_paths.values():
+                try:
+                    p.unlink(missing_ok=True)
+                except OSError:
+                    pass
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def cache_recent_image(self, event: AstrMessageEvent):
