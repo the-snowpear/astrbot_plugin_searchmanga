@@ -1,5 +1,7 @@
 import base64
 import json
+from pathlib import Path
+from typing import Any
 
 import aiohttp
 
@@ -10,81 +12,262 @@ SOUTUBOT_BASE = "https://soutubot.moe"
 SEARCH_ENDPOINT = f"{SOUTUBOT_BASE}/api/search"
 OK_STATUSES = {"ok", "partial"}
 
+GALLERY_PRIORITY = {
+    "ehentai": 0,
+    "nhentai": 1,
+    "panda": 2,
+    "jmcomic": 3,
+}
+BOORU_PRIORITY = {
+    "gelbooru": 0,
+    "danbooru": 1,
+}
+GALLERY_FAMILIES = {"nhentai", "ehentai", "panda", "jmcomic"}
 
-def _as_dict(value) -> dict:
+
+def _as_dict(value: Any) -> dict:
     return value if isinstance(value, dict) else {}
 
 
-def normalize_hit(hit: dict) -> dict | None:
-    """把 soutubot v2 的命中条目转换成插件内部沿用的旧结构。
+def _clean_url(value: Any) -> str:
+    text = str(value or "").strip()
+    if text.startswith(("http://", "https://", "jmcomic://")):
+        return text
+    return ""
 
-    v2 的 results[] 结构为::
 
-        {"score": 33.67, "path_segments": [
-            {"source_key": "nhentai",
-             "source_url": "https://nhentai.net/g/192882",
-             "thumbnail_url": "https://.../028.webp",
-             "metadata": {"source": {...}, "title": {"primary": "..."}}}], ...}
-
-    旧结构为 {title, source, similarity, pagePath, previewImageUrl}，
-    main.py / parsing.py 仍按旧结构读取，这里做一次归一化。
-    """
-    segments = hit.get("path_segments")
-    if not isinstance(segments, list):
-        return None
-    segment = next((s for s in segments if isinstance(s, dict)), None)
-    if segment is None:
-        return None
-
+def _segment_source_key(segment: dict) -> str:
     metadata = _as_dict(segment.get("metadata"))
-    source_metadata = _as_dict(metadata.get("source"))
-    title_metadata = _as_dict(metadata.get("title"))
+    source_meta = _as_dict(metadata.get("source"))
+    post_meta = _as_dict(metadata.get("post"))
+    key = (
+        source_meta.get("key")
+        or post_meta.get("source_key")
+        or metadata.get("source_key")
+        or segment.get("source_key")
+        or "unknown"
+    )
+    return str(key).strip().lower() or "unknown"
 
-    source = str(segment.get("source_key") or source_metadata.get("key") or "unknown")
-    title = str(
-        title_metadata.get("primary")
-        or title_metadata.get("japanese_or_alias")
-        or title_metadata.get("romanized")
-        or ""
-    ).strip()
-    if not title:
-        external_id = str(segment.get("external_id") or "").strip()
-        title = f"{source} {external_id}".strip()
 
-    url = (
-        source_metadata.get("url")
-        or segment.get("source_url")
-        or segment.get("page_url")
-        or segment.get("chapter_url")
+def _segment_source_id(segment: dict) -> str:
+    metadata = _as_dict(segment.get("metadata"))
+    source_meta = _as_dict(metadata.get("source"))
+    post_meta = _as_dict(metadata.get("post"))
+    value = (
+        source_meta.get("id")
+        or post_meta.get("post_id")
+        or metadata.get("external_id")
+        or segment.get("external_id")
         or ""
     )
+    return str(value).strip()
 
+
+def _segment_bucket(segment: dict) -> str:
+    family = str(segment.get("source_family") or "").strip().lower()
+    metadata = _as_dict(segment.get("metadata"))
+    kind = str(metadata.get("display_kind") or "").strip().lower()
+    key = _segment_source_key(segment)
+    if family == "booru" or kind == "booru":
+        return "booru"
+    if family in GALLERY_FAMILIES or key in GALLERY_PRIORITY or kind == "doujinshi":
+        return "gallery"
+    return "other"
+
+
+def _segment_has_metadata(segment: dict) -> bool:
+    return segment.get("metadata_status") == "found" and bool(segment.get("metadata"))
+
+
+def _segment_urls(segment: dict) -> tuple[str, str]:
+    """返回 (首选作品/页面链接, 预览缩略图链接)。"""
+    metadata = _as_dict(segment.get("metadata"))
+    source_meta = _as_dict(metadata.get("source"))
+    links = _as_dict(segment.get("links"))
+
+    source_url = (
+        _clean_url(source_meta.get("url"))
+        or _clean_url(links.get("source_url"))
+        or _clean_url(segment.get("source_url"))
+    )
+    chapter_url = _clean_url(links.get("chapter_url")) or _clean_url(segment.get("chapter_url"))
+    page_url = _clean_url(links.get("page_url")) or _clean_url(segment.get("page_url"))
+
+    source_key = _segment_source_key(segment)
+    external_id = _segment_source_id(segment)
+
+    # 优先使用画册详情页 URL（source_url），没有时回退章节页/单页，最后按 source_key 兜底。
+    url = source_url or chapter_url or page_url
+    if not url and external_id:
+        if source_key == "jmcomic" and external_id.isdigit():
+            url = f"https://18comic.vip/album/{external_id}"
+        elif source_key == "nhentai" and external_id.isdigit():
+            url = f"https://nhentai.net/g/{external_id}/"
+        elif source_key == "panda":
+            url = f"https://panda.chaika.moe/archive/{external_id}/"
+
+    thumb = (
+        _clean_url(segment.get("thumbnail_url"))
+        or _clean_url(links.get("thumbnail_url"))
+    )
+    return url, thumb
+
+
+def _segment_title(segment: dict, source: str, external_id: str) -> str:
+    metadata = _as_dict(segment.get("metadata"))
+    raw_title = metadata.get("title")
+    title = ""
+    if isinstance(raw_title, dict):
+        title = str(
+            raw_title.get("primary")
+            or raw_title.get("japanese_or_alias")
+            or raw_title.get("romanized")
+            or ""
+        ).strip()
+    elif isinstance(raw_title, str):
+        title = raw_title.strip()
+
+    if not title:
+        title = str(metadata.get("work_title") or "").strip()
+    if not title:
+        if source == "jmcomic" and external_id:
+            title = f"JM{external_id}"
+        elif external_id:
+            title = f"{source} #{external_id}".strip()
+        else:
+            title = source or "(无标题)"
+    return title or "(无标题)"
+
+
+def _is_proven_same_image_hit(hit: dict) -> bool:
+    segments = hit.get("path_segments")
+    if not isinstance(segments, list) or len(segments) < 2:
+        return False
+    group = hit.get("same_image_group")
+    if isinstance(group, dict):
+        return group.get("proven") is True
+    return "\x1e" in str(hit.get("raw_path") or "")
+
+
+def _segment_sort_key(segment: dict, bucket: str, orig_idx: int) -> tuple:
+    key = _segment_source_key(segment)
+    url, _ = _segment_urls(segment)
+    has_url = 0 if url else 1
+    has_meta = 0 if _segment_has_metadata(segment) else 1
+    if bucket == "gallery":
+        return (has_url, has_meta, GALLERY_PRIORITY.get(key, 99), orig_idx)
+    if bucket == "booru":
+        return (has_url, BOORU_PRIORITY.get(key, 99), has_meta, orig_idx)
+    return (has_url, has_meta, orig_idx)
+
+
+def _item_from_segment(
+    hit: dict,
+    segment: dict,
+    sibling_segments: list[dict] | None = None,
+) -> dict | None:
+    if not isinstance(segment, dict):
+        return None
+
+    source = _segment_source_key(segment)
+    external_id = _segment_source_id(segment)
+    url, thumb = _segment_urls(segment)
+
+    if not thumb and sibling_segments:
+        for sib in sibling_segments:
+            _, sib_thumb = _segment_urls(sib)
+            if sib_thumb:
+                thumb = sib_thumb
+                break
+
+    title = _segment_title(segment, source, external_id)
     try:
         similarity = round(float(hit.get("score") or 0), 2)
     except (TypeError, ValueError):
         similarity = 0.0
 
+    alternatives: list[tuple[str, str]] = []
+    seen_alt = {(source, url)}
+    for sib in sibling_segments or ():
+        if not isinstance(sib, dict):
+            continue
+        sib_source = _segment_source_key(sib)
+        sib_url, _ = _segment_urls(sib)
+        if sib_url and (sib_source, sib_url) not in seen_alt:
+            seen_alt.add((sib_source, sib_url))
+            alternatives.append((sib_source, sib_url))
+
     return {
-        "title": title or "(无标题)",
+        "title": title,
         "source": source,
         "similarity": similarity,
-        "pagePath": str(url),
-        "previewImageUrl": str(segment.get("thumbnail_url") or ""),
+        "pagePath": url,
+        "previewImageUrl": thumb,
+        "alternatives": alternatives,
     }
 
 
+def normalize_hit(hit: dict) -> dict | None:
+    """把 soutubot v2 单条命中转换为插件内部结构，支持 links 与多段优先级挑选。"""
+    segments = hit.get("path_segments")
+    if not isinstance(segments, list):
+        return None
+    dict_segments = [s for s in segments if isinstance(s, dict)]
+    if not dict_segments:
+        return None
+
+    # 优先选可下载的画廊分段，并保证有可用 URL 与元数据。
+    ranked = sorted(
+        enumerate(dict_segments),
+        key=lambda pair: (
+            0 if _segment_bucket(pair[1]) == "gallery" else 1,
+            _segment_sort_key(pair[1], _segment_bucket(pair[1]), pair[0]),
+        ),
+    )
+    primary = ranked[0][1]
+    return _item_from_segment(hit, primary, dict_segments)
+
+
 def normalize_results(results: object) -> list[dict]:
-    """归一化 + 按作品去重（同一画册的多页命中只保留相似度最高的一条）。"""
+    """对齐 soutubot v2 result_grouping 逻辑：分段展开/分组、按相似度降序并去重。"""
     if not isinstance(results, list):
         return []
 
-    deduped: dict[str, dict] = {}
+    raw_items: list[dict] = []
     for hit in results:
         if not isinstance(hit, dict):
             continue
-        item = normalize_hit(hit)
-        if not item:
+        segments = hit.get("path_segments")
+        if not isinstance(segments, list):
             continue
+        dict_segments = [s for s in segments if isinstance(s, dict)]
+        if not dict_segments:
+            continue
+
+        if not _is_proven_same_image_hit(hit):
+            for seg in dict_segments:
+                item = _item_from_segment(hit, seg, [seg])
+                if item:
+                    raw_items.append(item)
+            continue
+
+        buckets: dict[str, list[tuple[int, dict]]] = {}
+        for idx, seg in enumerate(dict_segments):
+            bucket = _segment_bucket(seg)
+            group_key = f"other:{idx}" if bucket == "other" else bucket
+            buckets.setdefault(group_key, []).append((idx, seg))
+
+        for group_key, pairs in buckets.items():
+            bucket = "other" if group_key.startswith("other:") else group_key
+            pairs.sort(key=lambda pair: _segment_sort_key(pair[1], bucket, pair[0]))
+            ordered_segs = [pair[1] for pair in pairs]
+            item = _item_from_segment(hit, ordered_segs[0], ordered_segs)
+            if item:
+                raw_items.append(item)
+
+    deduped: dict[str, dict] = {}
+    for item in raw_items:
         key = item["pagePath"] or f'{item["source"]}:{item["title"]}'
         current = deduped.get(key)
         if current is None or item["similarity"] > current["similarity"]:
@@ -104,11 +287,7 @@ async def fetch_image_bytes(url: str, timeout: int, proxy: str | None = None) ->
         file_path = url_clean[len("file://") :]
         if file_path.startswith("/") and len(file_path) > 3 and file_path[2] == ":":
             file_path = file_path.lstrip("/")
-        from pathlib import Path
-
         return Path(file_path).read_bytes()
-
-    from pathlib import Path
 
     try:
         local_p = Path(url_clean)
@@ -129,12 +308,7 @@ async def search_soutubot(
     timeout: int,
     proxy: str | None = None,
 ) -> dict:
-    """调用 soutubot v2 检索接口。
-
-    v2 取消了首页 challenge 参数与 X-API-KEY 鉴权，直接 multipart POST
-    /api/search 即可，响应中的命中结果位于 ``results`` 字段。
-    返回值为兼容旧版的结构：``{"data": [归一化后的条目...]}``。
-    """
+    """调用 soutubot v2 检索接口，返回归一化后的结果列表。"""
     headers = {
         "User-Agent": DEFAULT_UA,
         "Origin": SOUTUBOT_BASE,

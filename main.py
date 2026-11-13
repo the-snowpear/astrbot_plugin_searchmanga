@@ -17,16 +17,36 @@ from astrbot.core import astrbot_config, file_token_service
 from astrbot.core.utils.astrbot_path import get_astrbot_temp_path
 import astrbot.api.message_components as Comp
 
-from .downloaders import download_gallery
-from .models import DownloadIntent, SearchEntry
+from .constants import (
+    NSFW_POLICY_SEND,
+    OUTPUT_FORMAT_MERGE,
+    OUTPUT_FORMAT_PDF,
+    OUTPUT_FORMAT_ZIP,
+    PROXY_POLICY_ALL,
+    PROXY_POLICY_DISABLED,
+    PROXY_POLICY_DOWNLOAD_ONLY,
+    PROXY_POLICY_SEARCH_ONLY,
+    VALID_NSFW_POLICIES,
+    VALID_OUTPUT_FORMATS,
+)
+from .downloaders import download_gallery, parse_media_target
+from .models import DownloadIntent, ParsedMedia, SearchEntry
 from .onebot import (
+    ArbiterContext,
+    EmojiLikeArbiter,
     call_onebot_action,
     collect_forward_ids_from_components,
+    extract_forward_ids_from_onebot_message,
     get_forward_msg,
+    get_msg,
     iter_reply_components,
 )
+from .packaging import apply_nsfw_to_cover, render_info_card, temp_root
 from .parsing import (
+    extract_json_url,
+    extract_parse_targets,
     extract_text_from_forward_payload,
+    extract_text_from_onebot_segments,
     is_supported_url,
     parse_download_intent,
     parse_search_entries_from_text,
@@ -35,12 +55,6 @@ from .parsing import (
     source_from_url,
 )
 from .soutubot import fetch_image_bytes, search_soutubot
-from .constants import (
-    PROXY_POLICY_ALL,
-    PROXY_POLICY_DISABLED,
-    PROXY_POLICY_DOWNLOAD_ONLY,
-    PROXY_POLICY_SEARCH_ONLY,
-)
 
 
 RECENT_IMAGE_TTL = 600
@@ -49,15 +63,29 @@ SEND_FILE_TTL = 3600
 DOWNLOAD_DEDUP_MIN_TTL = 300
 DOWNLOAD_DEDUP_GRACE = 120
 DOWNLOAD_HANDLED_EXTRA = "searchmanga_download_handled"
+PARSE_HANDLED_EXTRA = "searchmanga_parse_handled"
 DEFAULT_BASE64_FILE_LIMIT_MB = 48
 DEFAULT_STREAM_CHUNK_KB = 256
 STREAM_FILE_RETENTION_MS = 5 * 60 * 1000
 ZIP_MAGIC_PREFIXES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
+PDF_MAGIC_PREFIX = b"%PDF-"
 GROUP_SETTING_TEMPLATE_KEY = "group"
 PROXY_SOURCE_SOUTUBOT = "soutubot"
 # source_proxies 中 proxy_url 填这些值表示“该来源强制直连”，用于覆盖默认代理。
 DIRECT_PROXY_TOKENS = {"", "direct", "none", "off", "disabled", "no"}
 _PROXY_UNSET = object()
+_RESERVED_COMMAND_PREFIXES = (
+    "/搜本子",
+    "/搜本",
+    "/soutu",
+    "/下载本子",
+    "/下载本",
+    "/解析",
+    "/jx",
+    "/parse",
+    "/开启解析",
+    "/关闭解析",
+)
 
 
 def _normalize_proxy_url(raw) -> str:
@@ -79,26 +107,46 @@ def _assert_valid_zip(path: Path) -> None:
         raise RuntimeError(f"ZIP 文件损坏: {path}") from exc
 
 
+def _assert_valid_pdf(path: Path) -> None:
+    if not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError(f"PDF 文件为空: {path}")
+    with path.open("rb") as fp:
+        head = fp.read(16)
+    if not head.startswith(PDF_MAGIC_PREFIX):
+        raise RuntimeError(f"文件不是有效的 PDF 格式: {path}")
+
+
+def _assert_valid_send_file(path: Path) -> None:
+    suffix = path.suffix.lower()
+    if suffix == ".zip":
+        _assert_valid_zip(path)
+    elif suffix == ".pdf":
+        _assert_valid_pdf(path)
+    elif not path.exists() or path.stat().st_size == 0:
+        raise RuntimeError(f"待发送文件为空或不存在: {path}")
+
+
 def _prepare_send_file(source_path: str, title: str) -> tuple[str, str]:
     source = Path(source_path).resolve()
     if not source.exists():
         raise FileNotFoundError(f"下载文件不存在: {source}")
-    _assert_valid_zip(source)
+    _assert_valid_send_file(source)
+    ext = source.suffix.lower() or ".zip"
     send_dir = Path(get_astrbot_temp_path()) / "searchmanga_downloads"
     send_dir.mkdir(parents=True, exist_ok=True)
     safe_title = sanitize_filename(title, "doujin")
-    file_name = f"{safe_title}.zip"
+    file_name = f"{safe_title}{ext}"
     unique_suffix = uuid.uuid4().hex[:8]
-    send_path = send_dir / f"{safe_title}_{unique_suffix}.zip"
+    send_path = send_dir / f"{safe_title}_{unique_suffix}{ext}"
     if source.resolve() != send_path.resolve():
         shutil.copy2(source, send_path)
-    _assert_valid_zip(send_path)
+    _assert_valid_send_file(send_path)
     return file_name, str(send_path.resolve())
 
 
-async def _assert_download_url_returns_zip(url: str) -> None:
+async def _assert_download_url_returns_supported_file(url: str, ext: str = ".zip") -> None:
     timeout = aiohttp.ClientTimeout(total=20, connect=8, sock_read=12)
-    headers = {"Range": "bytes=0-511", "User-Agent": "AstrBot-SearchManga/0.2"}
+    headers = {"Range": "bytes=0-511", "User-Agent": "AstrBot-SearchManga/0.3"}
     try:
         async with aiohttp.ClientSession(timeout=timeout, trust_env=True) as session:
             async with session.get(url, headers=headers) as resp:
@@ -113,12 +161,23 @@ async def _assert_download_url_returns_zip(url: str) -> None:
         raise RuntimeError(
             f"文件回调地址返回 HTTP {status}，不是可下载文件: {url}; {preview[:160]}"
         )
-    if not sample.startswith(ZIP_MAGIC_PREFIXES):
+    norm_ext = (ext or ".zip").lower()
+    if norm_ext == ".zip" and not sample.startswith(ZIP_MAGIC_PREFIXES):
         preview = sample.decode("utf-8", errors="replace").strip()
         raise RuntimeError(
             "文件回调地址返回的不是 ZIP 数据，已阻止发送，避免 NapCat 把错误页保存成 .zip。"
             f" status={status}, content-type={content_type or '(空)'}, preview={preview[:160]}"
         )
+    if norm_ext == ".pdf" and not sample.startswith(PDF_MAGIC_PREFIX):
+        preview = sample.decode("utf-8", errors="replace").strip()
+        raise RuntimeError(
+            "文件回调地址返回的不是 PDF 数据，已阻止发送。"
+            f" status={status}, content-type={content_type or '(空)'}, preview={preview[:160]}"
+        )
+
+
+async def _assert_download_url_returns_zip(url: str) -> None:
+    await _assert_download_url_returns_supported_file(url, ".zip")
 
 
 def _file_to_base64_resource(file_path: str) -> str:
@@ -157,8 +216,12 @@ def _extract_components_from_event(event: AstrMessageEvent) -> list[Any]:
     return components
 
 
+def _safe_isinstance(obj: Any, cls: Any) -> bool:
+    return isinstance(cls, type) and isinstance(obj, cls)
+
+
 def _extract_image_url_from_component(comp: Any) -> Optional[str]:
-    if isinstance(comp, Comp.Image):
+    if _safe_isinstance(comp, getattr(Comp, "Image", None)):
         url = (
             getattr(comp, "url", None)
             or getattr(comp, "file", None)
@@ -186,8 +249,9 @@ def _extract_image_url(event: AstrMessageEvent) -> Optional[str]:
         if url:
             return url
 
+    reply_cls = getattr(Comp, "Reply", None)
     for comp in components:
-        if isinstance(comp, Comp.Reply):
+        if _safe_isinstance(comp, reply_cls):
             for field in ("chain", "message", "content", "origin"):
                 sub_chain = getattr(comp, field, None)
                 if isinstance(sub_chain, list):
@@ -200,7 +264,6 @@ def _extract_image_url(event: AstrMessageEvent) -> Optional[str]:
                     if url:
                         return url
 
-    # 尝试从 raw_message 中解析
     raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
     if raw_message:
         from .onebot import extract_images_from_onebot_message
@@ -212,48 +275,52 @@ def _extract_image_url(event: AstrMessageEvent) -> Optional[str]:
     return None
 
 
-async def _resolve_image_url_async(event: AstrMessageEvent) -> Optional[str]:
-    """异步完整提取图片（含 OneBot 引用消息回查）"""
-    # 1. 尝试从本条消息直接提取
-    url = _extract_image_url(event)
-    if url:
-        return url
-
-    # 2. 检查是否有 Reply 组件需要拉取历史消息
-    components = _extract_components_from_event(event)
+def _collect_reply_message_ids(event: AstrMessageEvent) -> list[str | int]:
     reply_ids: list[str | int] = []
-    for comp in components:
-        if isinstance(comp, Comp.Reply):
-            msg_id = getattr(comp, "id", None) or getattr(comp, "message_id", None)
-            if msg_id:
-                reply_ids.append(msg_id)
+
+    def _add(val: Any) -> None:
+        if val is not None and str(val).strip() and val not in reply_ids:
+            reply_ids.append(val)
+
+    reply_cls = getattr(Comp, "Reply", None)
+    for comp in [*iter_reply_components(event), *_extract_components_from_event(event)]:
+        if _safe_isinstance(comp, reply_cls):
+            _add(getattr(comp, "id", None) or getattr(comp, "message_id", None))
         elif isinstance(comp, dict) and comp.get("type") == "reply":
             data = comp.get("data")
             if isinstance(data, dict):
-                msg_id = data.get("id") or data.get("message_id")
-                if msg_id:
-                    reply_ids.append(msg_id)
+                _add(data.get("id") or data.get("message_id"))
 
-    # 检查 raw_message 中的 reply 段
     raw_message = getattr(getattr(event, "message_obj", None), "raw_message", None)
     if isinstance(raw_message, dict):
         raw_reply = raw_message.get("reply")
         if isinstance(raw_reply, dict):
-            msg_id = raw_reply.get("message_id") or raw_reply.get("id")
-            if msg_id and msg_id not in reply_ids:
-                reply_ids.append(msg_id)
+            _add(raw_reply.get("message_id") or raw_reply.get("id"))
+        raw_segs = raw_message.get("message")
+        if isinstance(raw_segs, list):
+            for seg in raw_segs:
+                if isinstance(seg, dict) and seg.get("type") == "reply":
+                    data = seg.get("data")
+                    if isinstance(data, dict):
+                        _add(data.get("id") or data.get("message_id"))
     elif isinstance(raw_message, list):
         for seg in raw_message:
             if isinstance(seg, dict) and seg.get("type") == "reply":
                 data = seg.get("data")
                 if isinstance(data, dict):
-                    msg_id = data.get("id") or data.get("message_id")
-                    if msg_id and msg_id not in reply_ids:
-                        reply_ids.append(msg_id)
+                    _add(data.get("id") or data.get("message_id"))
+    return reply_ids
 
-    # 3. 对找到的 reply_ids 执行 OneBot get_msg 拉取被引用消息
+
+async def _resolve_image_url_async(event: AstrMessageEvent) -> Optional[str]:
+    """异步完整提取图片（含 OneBot 引用消息回查）"""
+    url = _extract_image_url(event)
+    if url:
+        return url
+
+    reply_ids = _collect_reply_message_ids(event)
     if reply_ids:
-        from .onebot import get_msg, extract_images_from_onebot_message
+        from .onebot import extract_images_from_onebot_message
 
         for r_id in reply_ids:
             try:
@@ -265,6 +332,7 @@ async def _resolve_image_url_async(event: AstrMessageEvent) -> Optional[str]:
                 logger.debug(f"获取引用消息图片失败: reply_id={r_id}, {exc}")
 
     return None
+
 
 def _event_text(event: AstrMessageEvent) -> str:
     getter = getattr(event, "get_message_str", None)
@@ -298,6 +366,16 @@ def _coerce_bool(value, default: bool) -> bool:
     return default
 
 
+def _is_under_dir(path_str: str | None, root: Path) -> bool:
+    if not path_str:
+        return False
+    try:
+        Path(path_str).resolve().relative_to(root.resolve())
+        return True
+    except Exception:
+        return False
+
+
 class SearchMangaPlugin(Star):
     def __init__(self, context: Context, config: AstrBotConfig):
         super().__init__(context)
@@ -306,6 +384,9 @@ class SearchMangaPlugin(Star):
         self._recent_searches: dict[str, tuple[list[SearchEntry], float]] = {}
         self._download_files: dict[str, tuple[str, float]] = {}
         self._download_claims: dict[str, float] = {}
+        self._parse_debounce: dict[str, float] = {}
+        self._session_parse_overrides: dict[str, bool] = {}
+        self._arbiter = EmojiLikeArbiter()
 
     def _cleanup_download_files(self) -> None:
         now = time.time()
@@ -341,13 +422,26 @@ class SearchMangaPlugin(Star):
         event.set_extra("agent_stop_requested", True)
         should_call_llm = getattr(event, "should_call_llm", None)
         if callable(should_call_llm):
-            should_call_llm(True)
+            should_call_llm(False)
 
     def _download_event_handled(self, event: AstrMessageEvent) -> bool:
         get_extra = getattr(event, "get_extra", None)
         if not callable(get_extra):
             return False
         return bool(get_extra(DOWNLOAD_HANDLED_EXTRA, False))
+
+    def _mark_parse_event_handled(self, event: AstrMessageEvent) -> None:
+        event.set_extra(PARSE_HANDLED_EXTRA, True)
+        event.set_extra("agent_stop_requested", True)
+        should_call_llm = getattr(event, "should_call_llm", None)
+        if callable(should_call_llm):
+            should_call_llm(False)
+
+    def _parse_event_handled(self, event: AstrMessageEvent) -> bool:
+        get_extra = getattr(event, "get_extra", None)
+        if not callable(get_extra):
+            return False
+        return bool(get_extra(PARSE_HANDLED_EXTRA, False))
 
     def _event_message_id(self, event: AstrMessageEvent) -> str:
         message_obj = getattr(event, "message_obj", None)
@@ -429,6 +523,62 @@ class SearchMangaPlugin(Star):
     def _download_concurrency(self) -> int:
         return max(1, int(self.config.get("download_concurrency", 4)))
 
+    def _auto_parse_enabled(self) -> bool:
+        return _coerce_bool(self.config.get("auto_parse_enabled", True), True)
+
+    def _parse_enable_reply(self) -> bool:
+        return _coerce_bool(self.config.get("parse_enable_reply", True), True)
+
+    def _parse_debounce_seconds(self) -> int:
+        try:
+            return max(0, int(self.config.get("parse_debounce_seconds", 10)))
+        except (TypeError, ValueError):
+            return 10
+
+    def _parse_arbiter_enabled(self) -> bool:
+        return _coerce_bool(self.config.get("parse_arbiter", True), True)
+
+    def _string_set_config(self, key: str) -> set[str]:
+        raw = self.config.get(key, []) or []
+        if not isinstance(raw, (list, tuple, set)):
+            return set()
+        return {str(item).strip() for item in raw if str(item or "").strip()}
+
+    def _output_format(self) -> str:
+        val = str(self.config.get("output_format", OUTPUT_FORMAT_ZIP) or "").strip().lower()
+        return val if val in VALID_OUTPUT_FORMATS else OUTPUT_FORMAT_ZIP
+
+    def _preview_count(self) -> int:
+        try:
+            return max(0, int(self.config.get("preview_count", 3)))
+        except (TypeError, ValueError):
+            return 3
+
+    def _max_pages(self) -> int:
+        try:
+            return max(0, int(self.config.get("max_pages", 200)))
+        except (TypeError, ValueError):
+            return 200
+
+    def _nsfw_policy(self) -> str:
+        val = str(self.config.get("nsfw_policy", NSFW_POLICY_SEND) or "").strip().lower()
+        return val if val in VALID_NSFW_POLICIES else NSFW_POLICY_SEND
+
+    def _render_parse_card(self) -> bool:
+        return _coerce_bool(self.config.get("render_parse_card", True), True)
+
+    def _iwara_cookie(self) -> str:
+        return str(self.config.get("iwara_cookie", "") or "")
+
+    def _iwara_video_quality(self) -> str:
+        return str(self.config.get("iwara_video_quality", "540") or "540").strip()
+
+    def _iwara_max_size_mb(self) -> int:
+        try:
+            return max(0, int(self.config.get("iwara_max_size_mb", 100)))
+        except (TypeError, ValueError):
+            return 100
+
     def _group_setting(self, event: AstrMessageEvent) -> dict | None:
         group_id = event.get_group_id()
         if not group_id:
@@ -503,10 +653,7 @@ class SearchMangaPlugin(Star):
         return _normalize_proxy_url(self.config.get("proxy_url", "http://127.0.0.1:7897"))
 
     def _source_proxy_map(self) -> dict[str, str]:
-        """解析 source_proxies 列表，返回 {来源: 代理地址}。
-
-        值为空字符串表示“该来源强制直连”，用于在开启全局代理时单独放行某个源。
-        """
+        """解析 source_proxies 列表，返回 {来源: 代理地址}。"""
         entries = self.config.get("source_proxies", [])
         mapping: dict[str, str] = {}
         if not isinstance(entries, list):
@@ -524,13 +671,6 @@ class SearchMangaPlugin(Star):
         return mapping
 
     def _proxy_for(self, phase: str, source: str | None = None) -> str | None:
-        """返回某个阶段/来源应使用的代理，None 表示直连。
-
-        优先级：
-        1. ``source_proxies`` 列表中为 ``source`` 显式配置的代理（含“强制直连”）；
-        2. 列表未命中时，回退到 ``proxy_enabled`` + ``proxy_policy`` + ``proxy_url``；
-        3. 两者都没配置则直连。
-        """
         override = self._source_proxy_map().get(
             (source or "").strip().lower(), _PROXY_UNSET
         )
@@ -577,7 +717,7 @@ class SearchMangaPlugin(Star):
 
     async def _validated_file_callback_url(self, file_path: str) -> str:
         probe_url = await self._file_callback_url(file_path)
-        await _assert_download_url_returns_zip(probe_url)
+        await _assert_download_url_returns_supported_file(probe_url, Path(file_path).suffix)
         return await self._file_callback_url(file_path)
 
     async def _send_onebot_file(
@@ -670,55 +810,6 @@ class SearchMangaPlugin(Star):
         )
         return str(stream_path)
 
-    async def _upload_file_stream_to_onebot_legacy(
-        self,
-        event: AstrMessageEvent,
-        file_path: str,
-        file_name: str,
-    ) -> str:
-        path = Path(file_path)
-        file_id = f"searchmanga_{uuid.uuid4().hex}"
-        file_size = path.stat().st_size
-        sha256 = hashlib.sha256()
-        chunk_size = self._stream_chunk_bytes()
-        offset = 0
-
-        with path.open("rb") as fp:
-            while True:
-                chunk = fp.read(chunk_size)
-                if not chunk:
-                    break
-                sha256.update(chunk)
-                await call_onebot_action(
-                    event,
-                    "upload_file_stream",
-                    file_id=file_id,
-                    name=file_name,
-                    total_size=file_size,
-                    offset=offset,
-                    chunk=_b64encode_chunk(chunk),
-                )
-                offset += len(chunk)
-
-        result = await call_onebot_action(
-            event,
-            "upload_file_stream",
-            file_id=file_id,
-            name=file_name,
-            total_size=file_size,
-            offset=file_size,
-            sha256=sha256.hexdigest(),
-            ret_path=True,
-            ret_path_with_upload_id=True,
-            file_retention_time=STREAM_FILE_RETENTION_MS,
-        )
-        if not isinstance(result, dict):
-            raise RuntimeError(f"upload_file_stream 返回异常: {result!r}")
-        stream_path = result.get("path") or result.get("file") or result.get("file_path")
-        if not stream_path:
-            raise RuntimeError(f"upload_file_stream 未返回可上传文件路径: {result!r}")
-        return str(stream_path)
-
     async def _send_download_file(
         self,
         event: AstrMessageEvent,
@@ -733,7 +824,7 @@ class SearchMangaPlugin(Star):
                 await self._send_onebot_file(event, resource, file_name, "base64")
                 return True, "base64"
             except Exception as exc:
-                logger.warning(f"[搜本子下载] base64 发送失败，改用 HTTP 回调: {exc}", exc_info=True)
+                logger.warning(f"[搜本子下载] base64 发送失败，改用流式上传: {exc}", exc_info=True)
 
         try:
             stream_path = await self._upload_file_stream_to_onebot(event, send_path, file_name)
@@ -759,9 +850,7 @@ class SearchMangaPlugin(Star):
         return str(self.config.get("node_name", "搜本子"))
 
     def _node_uin(self, event: AstrMessageEvent) -> str:
-        # Node.uin 的字段类型是 str | None。AstrBot 在 Python 3.14 上改用
-        # pydantic v2 直接校验消息组件，不再做 int -> str 的隐式转换，
-        # 这里必须显式转成字符串，否则构造合并转发节点时会抛 ValidationError。
+        # Node.uin 的字段类型是 str | None（pydantic v2 严格校验）
         self_id = getattr(event.message_obj, "self_id", None)
         if self_id:
             return str(self_id)
@@ -769,6 +858,11 @@ class SearchMangaPlugin(Star):
 
     def _session_key(self, event: AstrMessageEvent) -> str:
         return str(getattr(event, "unified_msg_origin", None) or event.get_session_id())
+
+    def _user_search_key(self, event: AstrMessageEvent) -> str:
+        session_key = self._session_key(event)
+        sender_id = str(event.get_sender_id() or "").strip() if callable(getattr(event, "get_sender_id", None)) else ""
+        return f"{session_key}:u:{sender_id}" if sender_id else session_key
 
     def _remember_image(self, event: AstrMessageEvent) -> None:
         image_url = _extract_image_url(event)
@@ -786,19 +880,27 @@ class SearchMangaPlugin(Star):
         return image_url
 
     def _remember_search(self, event: AstrMessageEvent, entries: list[SearchEntry]) -> None:
-        self._recent_searches[self._session_key(event)] = (entries, time.time())
+        now = time.time()
+        session_key = self._session_key(event)
+        user_key = self._user_search_key(event)
+        self._recent_searches[session_key] = (entries, now)
+        if user_key != session_key:
+            self._recent_searches[user_key] = (entries, now)
 
     def _recent_search_entry(self, event: AstrMessageEvent, index: int) -> SearchEntry | None:
-        item = self._recent_searches.get(self._session_key(event))
-        if not item:
-            return None
-        entries, saved_at = item
-        if time.time() - saved_at > RECENT_SEARCH_TTL:
-            self._recent_searches.pop(self._session_key(event), None)
-            return None
-        for entry in entries:
-            if entry.index == index:
-                return entry
+        now = time.time()
+        keys = [self._user_search_key(event), self._session_key(event)]
+        for key in keys:
+            item = self._recent_searches.get(key)
+            if not item:
+                continue
+            entries, saved_at = item
+            if now - saved_at > RECENT_SEARCH_TTL:
+                self._recent_searches.pop(key, None)
+                continue
+            for entry in entries:
+                if entry.index == index:
+                    return entry
         return None
 
     def _build_forward_nodes(self, event: AstrMessageEvent, entries: list[SearchEntry]) -> list[Comp.Node]:
@@ -825,6 +927,13 @@ class SearchMangaPlugin(Star):
                 f"来源: {entry.source}\n"
                 f"链接: {entry.url or '(无)'}"
             )
+            extra_links = [
+                alt_url
+                for _, alt_url in entry.alternatives
+                if alt_url and alt_url != entry.url and is_supported_url(alt_url)
+            ]
+            if extra_links:
+                text += f"\n备用: {extra_links[0]}"
             content: list = []
             if self._send_preview_image(event) and entry.preview_url:
                 content.append(Comp.Image.fromURL(entry.preview_url))
@@ -832,34 +941,72 @@ class SearchMangaPlugin(Star):
             nodes.append(Comp.Node(uin=node_uin, name=self._node_name(), content=content))
         return nodes
 
+    async def _collect_quoted_texts(self, event: AstrMessageEvent) -> list[str]:
+        texts: list[str] = []
+        seen_forwards: set[str] = set()
+
+        async def _expand_forward(forward_id: str, depth: int = 0) -> None:
+            fid = str(forward_id or "").strip()
+            if not fid or fid in seen_forwards or depth > 2:
+                return
+            seen_forwards.add(fid)
+            try:
+                payload = await get_forward_msg(event, fid)
+            except Exception as exc:
+                logger.debug(f"拉取合并转发消息失败: forward_id={fid}, {exc}")
+                return
+            text = extract_text_from_forward_payload(payload)
+            if text:
+                texts.append(text)
+            for nested_fid in extract_forward_ids_from_onebot_message(payload):
+                await _expand_forward(nested_fid, depth + 1)
+
+        replies: list[Any] = []
+        reply_cls = getattr(Comp, "Reply", None)
+        for comp in [*iter_reply_components(event), *_extract_components_from_event(event)]:
+            if _safe_isinstance(comp, reply_cls) or (isinstance(comp, dict) and comp.get("type") == "reply"):
+                if comp not in replies:
+                    replies.append(comp)
+
+        for reply in replies:
+            reply_text = getattr(reply, "message_str", None) or ""
+            if reply_text:
+                texts.append(reply_text)
+
+            reply_chain = getattr(reply, "chain", None) or getattr(reply, "message", None) or []
+            if reply_chain:
+                seg_text = extract_text_from_onebot_segments(reply_chain)
+                if seg_text:
+                    texts.append(seg_text)
+                for fid in collect_forward_ids_from_components(reply_chain):
+                    await _expand_forward(fid)
+
+        for reply_msg_id in _collect_reply_message_ids(event):
+            try:
+                msg_payload = await get_msg(event, reply_msg_id)
+            except Exception as exc:
+                logger.debug(f"get_msg 拉取被引用消息失败: reply_id={reply_msg_id}, {exc}")
+                continue
+            seg_text = extract_text_from_onebot_segments(msg_payload)
+            if seg_text:
+                texts.append(seg_text)
+            fwd_text = extract_text_from_forward_payload(msg_payload)
+            if fwd_text and fwd_text != seg_text:
+                texts.append(fwd_text)
+            for fid in extract_forward_ids_from_onebot_message(msg_payload):
+                await _expand_forward(fid)
+
+        return texts
+
     async def _entry_from_quoted_forward(
         self,
         event: AstrMessageEvent,
         index: int,
     ) -> SearchEntry | None:
-        for reply in iter_reply_components(event):
-            reply_text = getattr(reply, "message_str", None) or ""
-            if reply_text:
-                for entry in parse_search_entries_from_text(reply_text):
-                    if entry.index == index:
-                        return entry
-
-            reply_chain = getattr(reply, "chain", None) or []
-            plain_text = "\n".join(
-                getattr(seg, "text", "")
-                for seg in reply_chain
-                if isinstance(seg, Comp.Plain)
-            )
-            for entry in parse_search_entries_from_text(plain_text):
+        for text in await self._collect_quoted_texts(event):
+            for entry in parse_search_entries_from_text(text):
                 if entry.index == index:
                     return entry
-
-            for forward_id in collect_forward_ids_from_components(reply_chain):
-                payload = await get_forward_msg(event, forward_id)
-                text = extract_text_from_forward_payload(payload)
-                for entry in parse_search_entries_from_text(text):
-                    if entry.index == index:
-                        return entry
         return None
 
     async def _resolve_download_target(
@@ -884,9 +1031,10 @@ class SearchMangaPlugin(Star):
         if not intent.index:
             return None
         quoted = await self._entry_from_quoted_forward(event, intent.index)
-        if quoted:
-            return quoted
-        return self._recent_search_entry(event, intent.index)
+        recent = self._recent_search_entry(event, intent.index)
+        if quoted and recent and not quoted.alternatives and recent.alternatives:
+            quoted.alternatives = list(recent.alternatives)
+        return quoted or recent
 
     async def _has_download_context(
         self,
@@ -901,6 +1049,10 @@ class SearchMangaPlugin(Star):
         if quoted:
             return True
         return self._recent_search_entry(event, intent.index) is not None
+
+    def _download_output_format(self) -> str:
+        fmt = self._output_format()
+        return OUTPUT_FORMAT_PDF if fmt == OUTPUT_FORMAT_PDF else OUTPUT_FORMAT_ZIP
 
     async def _do_download(self, event: AstrMessageEvent, intent: DownloadIntent):
         if event.get_platform_name() != "aiocqhttp":
@@ -923,7 +1075,17 @@ class SearchMangaPlugin(Star):
             ).stop_event()
             return
 
-        if not is_supported_url(target.url):
+        candidate_urls: list[tuple[str, str]] = []
+        seen_urls: set[str] = set()
+        if is_supported_url(target.url):
+            candidate_urls.append((target.source or source_from_url(target.url), target.url))
+            seen_urls.add(target.url)
+        for alt_src, alt_url in target.alternatives:
+            if alt_url and alt_url not in seen_urls and is_supported_url(alt_url):
+                candidate_urls.append((alt_src or source_from_url(alt_url), alt_url))
+                seen_urls.add(alt_url)
+
+        if not candidate_urls:
             yield event.plain_result(f"暂不支持这个链接: {target.url}").stop_event()
             return
 
@@ -931,34 +1093,59 @@ class SearchMangaPlugin(Star):
             yield event.plain_result("已跳过重复下载：这条消息的下载任务正在处理或已经处理过。").stop_event()
             return
 
-        logger.info(f"[搜本子下载] 命中下载目标: 标题={target.title}, 来源={target.source}, url={target.url}")
+        logger.info(
+            f"[搜本子下载] 命中下载目标: 标题={target.title}, 来源={candidate_urls[0][0]}, url={candidate_urls[0][1]}"
+        )
         yield event.plain_result(f"开始下载: {target.title}")
-        try:
-            downloaded = await download_gallery(
-                target.url,
-                timeout=self._download_timeout(),
-                concurrency=self._download_concurrency(),
-                ehentai_cookie=self._ehentai_cookie(),
-                exhentai_cookie=self._exhentai_cookie(),
-                prefer_archive=self._prefer_archive_download(),
-                proxy=self._proxy_for("download", target.source),
-            )
-        except asyncio.TimeoutError:
-            yield event.plain_result("下载超时，请稍后重试或调大 download_timeout。").stop_event()
-            return
-        except Exception as exc:
-            logger.exception("本子下载失败")
-            yield event.plain_result(f"下载失败: {exc}").stop_event()
+
+        dl_format = self._download_output_format()
+        downloaded = None
+        last_exc: Exception | None = None
+        for cand_source, cand_url in candidate_urls:
+            try:
+                downloaded = await download_gallery(
+                    cand_url,
+                    timeout=self._download_timeout(),
+                    concurrency=self._download_concurrency(),
+                    ehentai_cookie=self._ehentai_cookie(),
+                    exhentai_cookie=self._exhentai_cookie(),
+                    prefer_archive=self._prefer_archive_download(),
+                    proxy=self._proxy_for("download", cand_source),
+                    output_format=dl_format,
+                    max_pages=self._max_pages(),
+                    iwara_cookie=self._iwara_cookie(),
+                    video_quality=self._iwara_video_quality(),
+                    iwara_max_size_mb=self._iwara_max_size_mb(),
+                )
+                break
+            except asyncio.TimeoutError as exc:
+                last_exc = exc
+                continue
+            except Exception as exc:
+                last_exc = exc
+                logger.warning(f"[搜本子下载] 尝试下载源失败 ({cand_source} / {cand_url}): {exc}")
+                continue
+
+        if downloaded is None:
+            if isinstance(last_exc, asyncio.TimeoutError):
+                yield event.plain_result("下载超时，请稍后重试或调大 download_timeout。").stop_event()
+            else:
+                logger.exception("本子下载失败")
+                yield event.plain_result(f"下载失败: {last_exc}").stop_event()
             return
 
         try:
             file_name, send_path = _prepare_send_file(downloaded.zip_path, downloaded.title)
         except Exception as exc:
-            logger.exception("下载 ZIP 校验失败")
-            yield event.plain_result(f"下载完成，但 ZIP 校验失败: {exc}").stop_event()
+            logger.exception("下载文件校验失败")
+            yield event.plain_result(f"下载完成，但文件校验失败: {exc}").stop_event()
             return
-        if hasattr(event, "track_temporary_local_file"):
-            event.track_temporary_local_file(downloaded.zip_path)
+        finally:
+            if _is_under_dir(downloaded.zip_path, temp_root()):
+                try:
+                    Path(downloaded.zip_path).unlink(missing_ok=True)
+                except OSError:
+                    pass
 
         try:
             sent, mode = await self._send_download_file(event, file_name, send_path)
@@ -974,6 +1161,219 @@ class SearchMangaPlugin(Star):
             self._cleanup_download_files()
             logger.info(f"[搜本子下载] 文件发送完成: {file_name}, 方式={mode}")
             yield event.plain_result("下载完成，文件已发送。").stop_event()
+
+    def _parse_session_allowed(self, event: AstrMessageEvent) -> bool:
+        session_key = self._session_key(event)
+        group_id = str(event.get_group_id() or "").strip()
+        ids = {x for x in (session_key, group_id, str(event.get_session_id() or "").strip()) if x}
+        for candidate in ids:
+            if candidate in self._session_parse_overrides:
+                return self._session_parse_overrides[candidate]
+
+        if not self._auto_parse_enabled():
+            return False
+
+        blacklist = self._string_set_config("parse_blacklist")
+        if ids & blacklist:
+            return False
+
+        whitelist = self._string_set_config("parse_whitelist")
+        if whitelist and not (ids & whitelist):
+            return False
+        return True
+
+    def _is_debounced_parse(self, event: AstrMessageEvent, target: str) -> bool:
+        ttl = self._parse_debounce_seconds()
+        if ttl <= 0:
+            return False
+        now = time.time()
+        expired = [k for k, ts in self._parse_debounce.items() if ts < now]
+        for k in expired:
+            self._parse_debounce.pop(k, None)
+        key = f"{self._session_key(event)}|{target}"
+        if key in self._parse_debounce:
+            return True
+        self._parse_debounce[key] = now + ttl
+        return False
+
+    def _extract_targets_from_event_sync(self, event: AstrMessageEvent, text: str) -> list[str]:
+        targets = extract_parse_targets(text)
+        seen = set(targets)
+        json_cls = getattr(Comp, "Json", None)
+        for comp in _extract_components_from_event(event):
+            raw_json = None
+            if _safe_isinstance(comp, json_cls):
+                raw_json = getattr(comp, "data", None)
+            elif isinstance(comp, dict) and comp.get("type") == "json":
+                raw_json = (comp.get("data") or {}).get("data") if isinstance(comp.get("data"), dict) else comp.get("data")
+            if raw_json is not None:
+                found = extract_json_url(raw_json)
+                if found and found not in seen:
+                    seen.add(found)
+                    targets.append(found)
+        return targets
+
+    async def _extract_targets_with_reply(self, event: AstrMessageEvent, text: str) -> list[str]:
+        targets = self._extract_targets_from_event_sync(event, text)
+        if targets or not self._parse_enable_reply():
+            return targets
+        seen: set[str] = set()
+        combined: list[str] = []
+        for q_text in await self._collect_quoted_texts(event):
+            for t in extract_parse_targets(q_text):
+                if t not in seen:
+                    seen.add(t)
+                    combined.append(t)
+        return combined
+
+    def _format_parse_text_summary(self, media: ParsedMedia) -> str:
+        lines = [f"[{media.platform.upper()}] {media.title}"]
+        if media.author:
+            lines.append(f"作者: {media.author}")
+        if media.extra_info:
+            lines.append(media.extra_info)
+        if media.summary:
+            summary_short = media.summary.strip().replace("\n", " ")
+            if len(summary_short) > 120:
+                summary_short = summary_short[:117] + "..."
+            lines.append(f"简介: {summary_short}")
+        lines.append(f"链接: {media.url}")
+        if media.skipped_download_reason:
+            lines.append(f"说明: {media.skipped_download_reason}")
+        return "\n".join(lines)
+
+    async def _parse_and_send(
+        self,
+        event: AstrMessageEvent,
+        targets: list[str],
+        *,
+        silent_if_ignored: bool = True,
+        require_download_permission_for_files: bool = True,
+    ):
+        for target in targets[:3]:
+            source = source_from_url(target)
+            output_fmt = self._output_format()
+            allow_file = not require_download_permission_for_files or self._allow_download(event)
+            download_file_flag = (output_fmt in {OUTPUT_FORMAT_ZIP, OUTPUT_FORMAT_PDF}) and allow_file
+            effective_fmt = output_fmt if download_file_flag or output_fmt == OUTPUT_FORMAT_MERGE else OUTPUT_FORMAT_MERGE
+
+            try:
+                media = await parse_media_target(
+                    target,
+                    timeout=self._download_timeout(),
+                    concurrency=self._download_concurrency(),
+                    ehentai_cookie=self._ehentai_cookie(),
+                    exhentai_cookie=self._exhentai_cookie(),
+                    prefer_archive=self._prefer_archive_download(),
+                    proxy=self._proxy_for("download", source),
+                    output_format=effective_fmt,
+                    preview_count=self._preview_count(),
+                    max_pages=self._max_pages(),
+                    nsfw_policy=self._nsfw_policy(),
+                    iwara_cookie=self._iwara_cookie(),
+                    video_quality=self._iwara_video_quality(),
+                    iwara_max_size_mb=self._iwara_max_size_mb(),
+                    download_gallery_file=download_file_flag,
+                )
+            except Exception as exc:
+                logger.exception(f"解析目标失败: {target}")
+                if not silent_if_ignored:
+                    yield event.plain_result(f"解析失败 ({target}): {exc}")
+                continue
+
+            card_path: Path | None = None
+            cover_tmp_path: Path | None = None
+            try:
+                if media.ignored_reason:
+                    if not silent_if_ignored:
+                        yield event.plain_result(media.ignored_reason)
+                    continue
+
+                if self._render_parse_card():
+                    card_path = render_info_card(media, nsfw_policy=self._nsfw_policy())
+
+                summary_text = self._format_parse_text_summary(media)
+                if card_path is None:
+                    safe_cover = apply_nsfw_to_cover(
+                        media.cover_bytes,
+                        is_nsfw=media.is_nsfw,
+                        nsfw_policy=self._nsfw_policy(),
+                    )
+                    if safe_cover:
+                        cover_tmp_path = temp_root() / f"cover_{uuid.uuid4().hex[:8]}.jpg"
+                        cover_tmp_path.write_bytes(safe_cover)
+
+                # Merge 转发模式（或仅预览 / 无文件）
+                if media.image_paths and not media.file_path and not media.video_path and event.get_platform_name() == "aiocqhttp":
+                    node_uin = self._node_uin(event)
+                    intro_content: list[Any] = []
+                    if card_path:
+                        intro_content.append(Comp.Image.fromFileSystem(str(card_path)))
+                    elif cover_tmp_path:
+                        intro_content.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
+                    if media.skipped_download_reason or card_path is None:
+                        intro_content.append(Comp.Plain(summary_text))
+                    nodes = [Comp.Node(uin=node_uin, name=self._node_name(), content=intro_content)]
+                    for img_p in media.image_paths:
+                        nodes.append(
+                            Comp.Node(
+                                uin=node_uin,
+                                name=self._node_name(),
+                                content=[Comp.Image.fromFileSystem(str(img_p))],
+                            )
+                        )
+                    yield event.chain_result([Comp.Nodes(nodes)])
+                    continue
+
+                # 卡片 / 文本摘要
+                if card_path:
+                    card_chain: list[Any] = [Comp.Image.fromFileSystem(str(card_path))]
+                    if media.skipped_download_reason:
+                        card_chain.append(Comp.Plain(f"\n{media.skipped_download_reason}"))
+                    yield event.chain_result(card_chain)
+                else:
+                    fallback_chain: list[Any] = []
+                    if cover_tmp_path:
+                        fallback_chain.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
+                    fallback_chain.append(Comp.Plain(summary_text))
+                    yield event.chain_result(fallback_chain)
+
+                # 发送 Iwara 视频
+                if media.video_path and Path(media.video_path).exists():
+                    video_cls = getattr(Comp, "Video", None)
+                    sent_video = False
+                    if video_cls and hasattr(video_cls, "fromFileSystem"):
+                        try:
+                            yield event.chain_result([video_cls.fromFileSystem(media.video_path)])
+                            sent_video = True
+                        except Exception as exc:
+                            logger.warning(f"直接发送视频段失败，回退群/私聊文件上传: {exc}")
+                    if not sent_video and event.get_platform_name() == "aiocqhttp" and allow_file:
+                        v_name, v_send = _prepare_send_file(media.video_path, media.title)
+                        await self._send_download_file(event, v_name, v_send)
+                    continue
+
+                # 发送图包 ZIP / PDF 文件
+                if media.file_path and Path(media.file_path).exists() and event.get_platform_name() == "aiocqhttp":
+                    f_name, f_send = _prepare_send_file(media.file_path, media.title)
+                    await self._send_download_file(event, f_name, f_send)
+            except Exception as exc:
+                logger.exception(f"发送解析结果失败: {target}")
+                yield event.plain_result(f"解析完成，但结果发送失败: {exc}")
+            finally:
+                for p in (card_path, cover_tmp_path):
+                    if p:
+                        try:
+                            p.unlink(missing_ok=True)
+                        except OSError:
+                            pass
+                if _is_under_dir(media.file_path, temp_root()):
+                    try:
+                        Path(media.file_path).unlink(missing_ok=True)  # type: ignore[arg-type]
+                    except OSError:
+                        pass
+                if _is_under_dir(media.work_dir, temp_root()):
+                    shutil.rmtree(media.work_dir, ignore_errors=True)  # type: ignore[arg-type]
 
     async def _do_search(
         self,
@@ -1047,6 +1447,8 @@ class SearchMangaPlugin(Star):
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def catch_download_text(self, event: AstrMessageEvent):
+        if self._download_event_handled(event) or self._parse_event_handled(event):
+            return
         text = _event_text(event)
         intent = parse_download_intent(text)
         if not intent:
@@ -1056,6 +1458,89 @@ class SearchMangaPlugin(Star):
         self._mark_download_event_handled(event)
         async for result in self._do_download(event, intent):
             yield result
+
+    @filter.event_message_type(filter.EventMessageType.ALL)
+    async def catch_auto_parse(self, event: AstrMessageEvent):
+        if self._download_event_handled(event) or self._parse_event_handled(event):
+            return
+        text = _event_text(event)
+        stripped = text.lstrip()
+        if any(stripped.lower().startswith(p.lower()) for p in _RESERVED_COMMAND_PREFIXES):
+            return
+        if stripped in {"开启解析", "关闭解析"}:
+            return
+        # 若消息是明确的“下载”指令，交由 catch_download_text 处理，避免冲突
+        if parse_download_intent(text):
+            return
+        if not self._parse_session_allowed(event):
+            return
+
+        targets = self._extract_targets_from_event_sync(event, text)
+        if not targets:
+            return
+
+        fresh_targets = [t for t in targets if not self._is_debounced_parse(event, t)]
+        if not fresh_targets:
+            return
+
+        if (
+            self._parse_arbiter_enabled()
+            and event.get_platform_name() == "aiocqhttp"
+            and event.get_group_id()
+        ):
+            mid_raw = self._event_message_id(event)
+            self_id_raw = getattr(getattr(event, "message_obj", None), "self_id", None)
+            msg_time_raw = getattr(getattr(event, "message_obj", None), "timestamp", None) or int(time.time())
+            if mid_raw.isdigit() and str(self_id_raw or "").isdigit():
+                ctx = ArbiterContext(
+                    message_id=int(mid_raw),
+                    msg_time=int(msg_time_raw),
+                    self_id=int(self_id_raw),
+                )
+                won = await self._arbiter.compete(event, ctx)
+                if not won:
+                    return
+
+        if self._download_event_handled(event) or self._parse_event_handled(event):
+            return
+        self._mark_parse_event_handled(event)
+        async for r in self._parse_and_send(event, fresh_targets, silent_if_ignored=True):
+            yield r
+
+    @filter.command("解析", alias={"jx", "parse"})
+    async def cmd_parse(self, event: AstrMessageEvent):
+        """解析 JM / E-Hentai / ExHentai / nHentai / Iwara / Panda 链接或 JM 号。"""
+        self._mark_parse_event_handled(event)
+        text = _event_text(event)
+        targets = await self._extract_targets_with_reply(event, text)
+        if not targets:
+            yield event.plain_result(
+                "请附带或引用包含 JM号 / JM / E-Hentai / ExHentai / nHentai / Iwara / Panda 链接的消息后再使用 /解析。"
+            )
+            return
+        async for r in self._parse_and_send(
+            event,
+            targets,
+            silent_if_ignored=False,
+            require_download_permission_for_files=False,
+        ):
+            yield r
+
+    @filter.command("开启解析")
+    async def cmd_enable_parse(self, event: AstrMessageEvent):
+        """在当前会话开启自动链接解析。"""
+        self._mark_parse_event_handled(event)
+        key = str(event.get_group_id() or "").strip() or self._session_key(event)
+        self._session_parse_overrides[key] = True
+        yield event.plain_result("已在当前会话开启链接自动解析。")
+
+    @filter.command("关闭解析")
+    async def cmd_disable_parse(self, event: AstrMessageEvent):
+        """在当前会话关闭自动链接解析。"""
+        self._mark_parse_event_handled(event)
+        key = str(event.get_group_id() or "").strip() or self._session_key(event)
+        self._session_parse_overrides[key] = False
+        yield event.plain_result("已在当前会话关闭链接自动解析。")
 
     @filter.command("搜本子", alias={"搜本", "soutu"})
     async def cmd_search(self, event: AstrMessageEvent):
@@ -1086,7 +1571,7 @@ class SearchMangaPlugin(Star):
         index: int = 0,
         jm_id: str = "",
     ):
-        """下载本子并发送 zip 文件。可用于用户要求下载本子、下载某个搜索结果、下载 nHentai/E-Hentai/ExHentai/Panda/JMComic 链接时。
+        """下载本子并发送 ZIP/PDF 文件。可用于用户要求下载本子、下载某个搜索结果、下载 nHentai/E-Hentai/ExHentai/Panda/JMComic 链接时。
 
         Args:
             url(string): 要下载的本子链接，支持 nHentai、E-Hentai、ExHentai、Panda、JMComic 链接；没有链接时留空。
@@ -1113,6 +1598,25 @@ class SearchMangaPlugin(Star):
             return
 
         async for r in self._do_download(event, intent):
+            yield r
+
+    @filter.llm_tool(name="parse_media_url")
+    async def llm_parse_media(self, event: AstrMessageEvent, target: str):
+        """解析 JM / E-Hentai / ExHentai / nHentai / Iwara / Panda 链接或 JM 号，生成元信息卡片并按配置发送预览、视频或文件。
+
+        Args:
+            target(string): 目标链接或 JM 编号（如 https://www.iwara.tv/video/xxx 或 JM123456）。
+        """
+        if self._parse_event_handled(event) or self._download_event_handled(event):
+            return
+        targets = extract_parse_targets(target)
+        if not targets and is_supported_url(target.strip()):
+            targets = [target.strip()]
+        if not targets:
+            yield event.plain_result(f"无法识别受支持的解析目标: {target}")
+            return
+        self._mark_parse_event_handled(event)
+        async for r in self._parse_and_send(event, targets, silent_if_ignored=False):
             yield r
 
     async def terminate(self):

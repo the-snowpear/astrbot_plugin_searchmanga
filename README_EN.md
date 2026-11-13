@@ -5,13 +5,13 @@
 <h1 align="center">astrbot_plugin_searchmanga</h1>
 
 <p align="center">
-  <b>Reverse image search for doujinshi</b> · search · forward · download
+  <b>Reverse image search & link parser</b> · search · forward · ZIP / PDF / preview · Iwara video & galleries
 </p>
 
 <p align="center">
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-4.x-1f6feb?style=flat-square" alt="AstrBot"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.2.1-22c55e?style=flat-square" alt="Version"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.3.0-22c55e?style=flat-square" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8b5cf6?style=flat-square" alt="License"></a>
   <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga"><img src="https://img.shields.io/badge/platform-aiocqhttp-f97316?style=flat-square" alt="Platform"></a>
   <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga/stargazers"><img src="https://img.shields.io/github/stars/the-snowpear/astrbot_plugin_searchmanga?style=flat-square&color=f97316&label=stars" alt="Stars"></a>
@@ -100,7 +100,9 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | Command | Aliases | Parameters | Description |
 | :--- | :--- | :--- | :--- |
 | `/搜本子` | `/搜本`, `/soutu` | Image (optional) | Send with an attached image, or send the command and reply to an image |
-| `/下载本子` | `/下载`, `/dl`, `/下本` | `<Index / URL / JM ID>` | Download the specified search result index, gallery URL, or JM ID |
+| `/下载本子` | `/下载`, `/dl`, `/下本` | `<Index / URL / JM ID>` | Download the specified search result index, gallery URL, or JM ID (with mirror fallback) |
+| `/解析` | `/jx`, `/parse` | `<URL / JM ID>` or reply | Parse JM / E-Hentai / ExHentai / nHentai / Iwara / Panda targets into info cards + media/files |
+| `/开启解析` / `/关闭解析` | — | — | Enable/disable automatic link parsing in the current group or session |
 
 > **Tip**: The plugin features an image cache (retained for 10 minutes by default). If you send an image first, sending `/搜本子` in your next message will automatically capture that image.
 
@@ -124,11 +126,12 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 
 | Platform | Mode | Description |
 | :--- | :--- | :--- |
-| **nHentai** | Concurrent Page Fetching | Supports multiple domains (`nhentai.net`, `nhentai.xxx`), automatic retries, and proxy acceleration. |
-| **E-Hentai** | Archive / Page Fetching | Attempts fast direct download via `archiver.php` first, falling back to concurrent page fetching; supports user Cookie. |
-| **ExHentai** | Archive / Page Fetching | ExHentai galleries; requires configuring a valid `exhentai_cookie` (must include `igneous`, `ipb_member_id`, `ipb_pass_hash`, etc.). |
+| **nHentai** | API v2 + Fallbacks | Prefers API v2 (`/api/v2/galleries` + `/api/v2/cdn`), falling back to v1/HTML and `curl_cffi` mirrors. |
+| **E-Hentai** | API + Page Fetching | Supports `/g/` and `/s/` links, `gdata`/`showpage` API, dynamic pagination, `nl` reload on 509, and free archives. |
+| **ExHentai** | API + Page Fetching | ExHentai galleries with strict cookie scoping (never leaks cookies to H@H nodes); requires `exhentai_cookie`. |
 | **Panda** | Direct Archive Download | Fast archive downloader for Panda archive mirrors. |
-| **JMComic** | Chapter Fetching / Decryption | Built on the `jmcomic` Python library; supports downloading directly by album ID (`JMxxxxxx`) or URL. |
+| **JMComic** | Ordered Chapters / Decode | Uses `jmcomic` SDK with UTF-8 BOM patch, `/photo/` vs `/album/` isolation, chapter-ordered decode, and `JMxxxxxx` IDs. |
+| **Iwara** | Video & Image Parser | Uses `curl_cffi` + `X-Version` signing for `iwara.tv` / `ecchi.iwara.tv` videos and image sets with quality/size/NSFW controls. |
 
 ---
 
@@ -184,6 +187,15 @@ Configure these settings in the AstrBot WebUI under **Plugin Configuration**:
 | `source_proxies` | `list` | `[]` | Per-source proxy overrides; entries take precedence over the global proxy. |
 | `file_callback_base` | `string`| `""` | Base URL for OneBot client to access AstrBot files (e.g., `http://192.168.1.100:6185`). |
 | `group_settings` | `list` | `[]` | Per-group overrides for preview images and download permissions. |
+| `auto_parse_enabled` | `bool` | `true` | Auto-parse JM / E-Hentai / ExHentai / nHentai / Iwara / Panda links and JM IDs in messages. |
+| `output_format` | `string` | `"zip"` | Output format: `zip`, `pdf`, or `merge` (info card + preview forward). |
+| `preview_count` | `int` | `3` | Maximum preview pages attached in `merge` mode. |
+| `max_pages` | `int` | `200` | Maximum page limit for full downloads (`0` for unlimited). |
+| `nsfw_policy` | `string` | `"send"` | R18 cover/preview handling: `send`, `blur`, or `ignore`. |
+| `render_parse_card` | `bool` | `true` | Render Pillow visual info cards for parse results. |
+| `parse_arbiter` | `bool` | `true` | Multi-bot group reaction arbiter to avoid duplicate replies. |
+| `parse_debounce_seconds` | `int` | `10` | Per-session cooldown in seconds for repeated identical targets. |
+| `iwara_cookie` / `iwara_video_quality` / `iwara_max_size_mb` | — | `""` / `"540"` / `100` | Optional Iwara cookie/token, preferred quality, and video size limit (MB). |
 
 ### Per-Group Configuration Template
 
@@ -228,7 +240,7 @@ Precedence:
 3. Sources not listed fall back to `proxy_enabled` / `proxy_policy` / `proxy_url`.
 4. With nothing configured, every request goes direct — same as before.
 
-Valid `source` values: `soutubot` (search), `nhentai`, `ehentai`, `exhentai`, `panda`, `jmcomic` (download).
+Valid `source` values: `soutubot` (search), `nhentai`, `ehentai`, `exhentai`, `panda`, `jmcomic`, `iwara` (download & parse).
 
 ---
 
@@ -248,23 +260,33 @@ Native support for AstrBot LLM tool calling:
   - `index` (*number*): Index number from the latest search result list (e.g., `1`).
   - `jm_id` (*string*): JMComic numeric album ID (e.g., `123456`).
 
+### 3. `parse_media_url`
+- **Purpose**: Parse JM, E-Hentai, ExHentai, nHentai, Iwara, or Panda links/JM IDs into info cards and preview/video/archive outputs.
+- **Arguments**:
+  - `target` (*string*): Target URL or JM ID.
+
 ---
 
 ## 🧩 Project Structure
 
 ```text
 astrbot_plugin_searchmanga/
-├── main.py            # Plugin entry: commands, LLM tools, forward messages, download orchestration
-├── soutubot.py        # soutubot.moe client (auth challenge, request wrapper)
-├── downloaders.py     # Per-site gallery fetching and ZIP packaging
-├── onebot.py          # OneBot protocol helpers (forward, reply, file upload)
-├── parsing.py         # URL / text parsing and filename sanitising
-├── models.py          # Data models (SearchEntry / DownloadIntent)
-├── constants.py       # Proxy policy constants
+├── main.py            # Plugin entry: search, parser, commands, LLM tools, OneBot delivery
+├── soutubot.py        # soutubot.moe v2 client & result grouping normalization
+├── jm_service.py      # JMComic parser/downloader (BOM patch, photo/album chapter ordering)
+├── ehentai_service.py # E-Hentai / ExHentai service (API+HTML, cookie isolation, 509 handling)
+├── nhentai_service.py # nHentai service (API v2 + v1/HTML fallbacks)
+├── iwara_service.py   # Iwara video & image gallery parser with X-Version signing
+├── downloaders.py     # Unified parse/download dispatcher & Panda support
+├── packaging.py       # ZIP/PDF builders, image verification, NSFW blur & info cards
+├── onebot.py          # OneBot helpers (get_msg, get_forward_msg, stream upload, arbiter)
+├── parsing.py         # URL/intent/JSON card/forward payload parsing
+├── models.py          # Data models (SearchEntry / DownloadIntent / ParsedMedia)
+├── constants.py       # Hosts & policy constants
 ├── _conf_schema.json  # WebUI configuration schema
 ├── metadata.yaml      # Plugin metadata
 ├── docs/              # Documentation assets (SVG / icon)
-└── tests/             # Unit tests for parsing and URL generation
+└── tests/             # Unit tests
 ```
 
 ---

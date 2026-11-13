@@ -5,13 +5,13 @@
 <h1 align="center">astrbot_plugin_searchmanga</h1>
 
 <p align="center">
-  <b>以图搜本子</b> · 搜图 · 合并转发 · 一键打包下载
+  <b>以图搜本子 & 链接解析下载</b> · 搜图 · 合并转发 · ZIP / PDF / 预览 · Iwara 视频/图集
 </p>
 
 <p align="center">
   <a href="https://github.com/AstrBotDevs/AstrBot"><img src="https://img.shields.io/badge/AstrBot-4.x-1f6feb?style=flat-square" alt="AstrBot"></a>
   <a href="https://www.python.org/"><img src="https://img.shields.io/badge/Python-3.12%20%7C%203.14-3776AB?style=flat-square&logo=python&logoColor=white" alt="Python"></a>
-  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.2.1-22c55e?style=flat-square" alt="Version"></a>
+  <a href="CHANGELOG.md"><img src="https://img.shields.io/badge/version-0.3.0-22c55e?style=flat-square" alt="Version"></a>
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-8b5cf6?style=flat-square" alt="License"></a>
   <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga"><img src="https://img.shields.io/badge/platform-aiocqhttp-f97316?style=flat-square" alt="Platform"></a>
   <a href="https://github.com/the-snowpear/astrbot_plugin_searchmanga/stargazers"><img src="https://img.shields.io/github/stars/the-snowpear/astrbot_plugin_searchmanga?style=flat-square&color=f97316&label=stars" alt="Stars"></a>
@@ -101,7 +101,9 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | 指令 | 别名 | 附带参数 | 说明 |
 | :--- | :--- | :--- | :--- |
 | `/搜本子` | `/搜本`, `/soutu` | 可选附带图片 | 发送带图片的指令，或发送指令后回复目标图片 |
-| `/下载本子` | `/下载`, `/dl`, `/下本` | `<序号 / URL / JM号>` | 下载搜索列表中的指定序号、画册 URL 或 JM 号 |
+| `/下载本子` | `/下载`, `/dl`, `/下本` | `<序号 / URL / JM号>` | 下载搜索列表中的指定序号、画册 URL 或 JM 号（支持备选源自动回退） |
+| `/解析` | `/jx`, `/parse` | `<URL / JM号>` 或引用 | 解析 JM / E-Hentai / ExHentai / nHentai / Iwara / Panda 链接或引用消息（支持信息卡片与视频/ZIP/PDF/预览） |
+| `/开启解析` / `/关闭解析` | — | — | 在当前会话或群聊开启/关闭自动链接解析 |
 
 > **提示**：插件拥有图片缓存机制（默认保留 10 分钟）。在群里发图后，直接在下一条消息发送 `/搜本子` 也能自动捕获刚才那张图。
 
@@ -125,11 +127,12 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 
 | 平台名称 | 模式 | 说明 |
 | :--- | :--- | :--- |
-| **nHentai** | 逐页高清抓图 | 支持多域名（`nhentai.net`, `nhentai.xxx` 等），自动重试与代理加速 |
-| **E-Hentai** | 归档 / 逐页抓取 | 优先尝试 `archiver.php` 归档直下，失败自动回退逐页抓取；支持配置 Cookie |
-| **ExHentai** | 归档 / 逐页抓取 | 里站画册，需在配置项中填写有效 `exhentai_cookie`（含 `igneous`, `ipb_member_id`, `ipb_pass_hash` 等） |
+| **nHentai** | API v2 + 回退抓图 | 优先使用 API v2 (`/api/v2/galleries` + `/api/v2/cdn`)，支持多域名（`nhentai.net`, `nhentai.xxx`）、`curl_cffi` 回退及图片校验 |
+| **E-Hentai** | API + 分页抓图 | 支持 `/g/` 与 `/s/` 阅读页链接解析、`gdata`/`showpage` API、动态分页、509/`nl` 换源重载与免 GP 归档 |
+| **ExHentai** | API + 分页抓图 | 里站画册，Cookie 严格作用域隔离不泄露给 H@H 节点；需配置 `exhentai_cookie`（含 `igneous`, `ipb_member_id`, `ipb_pass_hash`） |
 | **Panda** | 归档直下 | 针对熊猫归档站点的快速打包下载 |
-| **JMComic (禁漫)** | 章节抓取 / 解密 | 基于 `jmcomic` SDK，支持 `JMxxxxxx` 纯数字 ID 或画册链接直接下载 |
+| **JMComic (禁漫)** | 章节抓取 / 解密 | 基于 `jmcomic` SDK + UTF-8 BOM 容错补丁；支持 `/photo/` 单话与 `/album/` 多话按序防覆盖抓取与 `JMxxxxxx` 车号解析 |
+| **Iwara** | 视频 / 图集解析 | 基于 `curl_cffi` + `X-Version` 签名，支持 `iwara.tv` / `ecchi.iwara.tv` 视频与图集、清晰度降级、体积限制与 NSFW 策略 |
 
 ---
 
@@ -174,6 +177,15 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | `source_proxies` | `list` | `[]` | 按来源单独配置代理，列表内优先于全局代理 |
 | `file_callback_base` | `string` | `""` | 协议端访问 AstrBot 文件的基础 URL（如 `http://192.168.1.100:6185`） |
 | `group_settings` | `list` | `[]` | 群聊个性化独立设置列表 |
+| `auto_parse_enabled` | `bool` | `true` | 是否自动解析聊天中的 JM/EH/ExHentai/nHentai/Iwara/Panda 链接与 JM 号 |
+| `output_format` | `string` | `"zip"` | 下载与解析输出格式：`zip` / `pdf` / `merge`（卡片+预览图合并转发） |
+| `preview_count` | `int` | `3` | `merge` 模式展示的最大预览页数 |
+| `max_pages` | `int` | `200` | 单本下载页数上限（超过则只发元数据卡片，0 为不限制） |
+| `nsfw_policy` | `string` | `"send"` | NSFW/Ecchi 封面与预览策略：`send` / `blur`（高斯模糊） / `ignore` |
+| `render_parse_card` | `bool` | `true` | 是否渲染可视化解析信息卡片 |
+| `parse_arbiter` | `bool` | `true` | 群聊多 Bot 表情仲裁，避免重复刷屏 |
+| `parse_debounce_seconds` | `int` | `10` | 同会话相同目标防抖冷却（秒） |
+| `iwara_cookie` / `iwara_video_quality` / `iwara_max_size_mb` | — | `""` / `"540"` / `100` | Iwara 登录凭证、优先清晰度与视频大小上限 |
 
 ### 群聊个性化配置模板
 
@@ -217,7 +229,7 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 3. **列表未命中的来源**：回退到上方的 `proxy_enabled` / `proxy_policy` / `proxy_url`。
 4. **什么都没配置**：全部直连，行为与之前一致。
 
-可用的 `source`：`soutubot`（搜图）、`nhentai`、`ehentai`、`exhentai`、`panda`、`jmcomic`（下载）。
+可用的 `source`：`soutubot`（搜图）、`nhentai`、`ehentai`、`exhentai`、`panda`、`jmcomic`、`iwara`（下载与解析）。
 
 ---
 
@@ -239,23 +251,34 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
   - `index` (*number*)：最近一次搜索结果中的条目序号（如 `1`）。
   - `jm_id` (*string*)：JMComic 纯数字 ID（如 `123456`）。
 
+### 3. `parse_media_url`
+
+- **用途**：解析 JM / E-Hentai / ExHentai / nHentai / Iwara / Panda 链接或 JM 号，输出详情卡片及对应视频/预览/文件。
+- **参数**：
+  - `target` (*string*)：目标链接或 JM 号。
+
 ---
 
 ## 🧩 项目结构
 
 ```text
 astrbot_plugin_searchmanga/
-├── main.py            # 插件入口：指令、LLM 工具、合并转发、下载编排
-├── soutubot.py        # soutubot.moe 检索客户端（鉴权参数、请求封装）
-├── downloaders.py     # 各站点画册抓取与 ZIP 打包
-├── onebot.py          # OneBot 协议交互（转发、引用、文件上传）
-├── parsing.py         # 链接 / 文本解析与文件名清洗
-├── models.py          # 数据模型（SearchEntry / DownloadIntent）
-├── constants.py       # 代理策略等常量
+├── main.py            # 插件入口：搜图、指令、链接自动解析、OneBot 发送与 LLM 工具
+├── soutubot.py        # soutubot.moe v2 检索与分段归组规范化
+├── jm_service.py      # JMComic 解析下载服务（BOM 补丁、单话/专辑有序抓图解密）
+├── ehentai_service.py # E-Hentai / ExHentai 解析下载服务（API+HTML、Cookie 隔离、509 处理）
+├── nhentai_service.py # nHentai 解析下载服务（API v2 + v1/HTML 回退）
+├── iwara_service.py   # Iwara 视频 / 图集解析与签名下载
+├── downloaders.py     # 统一下载/解析分发入口与 Panda 支持
+├── packaging.py       # ZIP/PDF 打包、图片校验、NSFW 模糊与 Pillow 信息卡渲染
+├── onebot.py          # OneBot 协议交互（get_msg/get_forward_msg/流式上传/表情仲裁）
+├── parsing.py         # 链接/Intent/JSON 分享卡片/合并转发文本解析
+├── models.py          # 数据模型（SearchEntry / DownloadIntent / ParsedMedia）
+├── constants.py       # 站点主机与策略常量
 ├── _conf_schema.json  # WebUI 配置项定义
 ├── metadata.yaml      # 插件元信息
 ├── docs/              # 文档视觉素材（SVG / 图标）
-└── tests/             # 解析与链接生成的单元测试
+└── tests/             # 单元测试
 ```
 
 ---

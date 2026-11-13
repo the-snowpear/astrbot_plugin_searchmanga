@@ -4,6 +4,22 @@
 
 ---
 
+## [0.3.0] - 2026-11-13
+
+### 🚀 新增特性 (Added)
+- **链接解析管线**（参考 `Zhalstar/astrbot_plugin_parser` 的 MIT 设计）：支持自动解析消息/QQ JSON 卡片中的 JMComic、E-Hentai、ExHentai、nHentai、Iwara（视频与图集）、Panda 链接与单独 JM 号，支持群聊白名单/黑名单、同会话防抖冷却（`parse_debounce_seconds`）与多 Bot 表情仲裁（`parse_arbiter`）。
+- **新增指令与 LLM 工具**：`/解析`（别名 `/jx`、`/parse`，支持附带链接或引用含链接/转发的消息）、`/开启解析`、`/关闭解析` 与 LLM 工具 `parse_media_url`。
+- **多格式输出与安全策略**：支持配置 `output_format`（`zip` / `pdf` / `merge`）、`preview_count`、`max_pages`（超页自动跳过全本）、`nsfw_policy`（`send` / `blur` / `ignore`）与 Pillow 可视化信息卡片渲染（`render_parse_card`）。
+- **模块化服务架构**：拆分为 `jm_service.py`、`ehentai_service.py`、`nhentai_service.py`、`iwara_service.py`、`packaging.py` 与统一分发 `downloaders.py`。
+
+### 🐛 修复 (Fixed)
+- **修复「下载第 N 个」引用失效与误触发**：`Comp.Reply.chain` 为空时通过 OneBot `get_msg` -> 递归查找 `forward` 段 -> `get_forward_msg` 还原合并转发条目；修复 `_mark_download_event_handled` 误传 `should_call_llm(True)` 导致的下载后重复响应；按 `(session, user)` 隔离最近搜索缓存。
+- **修复 `soutubot` v2 结果归一化**：对齐 `same_image_group` / `path_segments` / `links` 优先级逻辑，保留 `alternatives` 并在下载失败时自动尝试备选源。
+- **修复 `parse_download_intent` URL 劫持**：优先解析受支持的完整链接，防止其他网站路径偶然含 `jm\d+` 被当成 JM 号。
+- **修复 JMComic 下载问题**：注入幂等 UTF-8 BOM 容错补丁（`\xef\xbb\xbf`）；区分 `/photo/<id>` 单话与 `/album/<id>` 全专辑；按 `(ep_idx, page_idx)` 严格排序解密避免多话文件互相覆盖。
+- **修复 E-Hentai / ExHentai 下载问题**：接入 `gdata` / `showpage` API + `#gdt` / `?nw=1` HTML、动态分页、`509` / SadPanda 检测、`nl` 换源重试与图片字节校验；严格隔离站点 Cookie 不泄露给 `*.hath.network`；支持 `/s/` 阅读页反查画廊、免 GP 归档与 EH ↔ Ex 自动回退。
+- **升级 nHentai 下载器**：优先使用 API v2（`/api/v2/galleries` + `/api/v2/cdn`），保留 v1 JSON / HTML 与 `curl_cffi` 回退。
+
 ## [0.2.2] - 2026-10-23
 
 ### 🐛 修复 (Fixed)
