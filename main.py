@@ -560,7 +560,38 @@ class SearchMangaPlugin(Star):
         except (TypeError, ValueError):
             return 200
 
-    def _nsfw_policy(self) -> str:
+    def _find_group_config_entry(
+        self,
+        event: AstrMessageEvent | None,
+        config_key: str,
+    ) -> dict | None:
+        if event is None:
+            return None
+        group_id = event.get_group_id()
+        if not group_id:
+            return None
+        group_id = str(group_id).strip()
+        settings = self.config.get(config_key, []) or []
+        if not isinstance(settings, list):
+            return None
+        for item in settings:
+            if not isinstance(item, dict):
+                continue
+            template_key = item.get("__template_key") or item.get("template")
+            if template_key and template_key != GROUP_SETTING_TEMPLATE_KEY:
+                continue
+            if str(item.get("group_id", "")).strip() == group_id:
+                return item
+        return None
+
+    def _nsfw_policy(self, event: AstrMessageEvent | None = None) -> str:
+        for config_key in ("nsfw_group_settings", "group_settings"):
+            entry = self._find_group_config_entry(event, config_key)
+            if entry is not None:
+                group_val = str(entry.get("nsfw_policy", "") or "").strip().lower()
+                if group_val in VALID_NSFW_POLICIES:
+                    return group_val
+
         val = str(self.config.get("nsfw_policy", NSFW_POLICY_SEND) or "").strip().lower()
         return val if val in VALID_NSFW_POLICIES else NSFW_POLICY_SEND
 
@@ -580,22 +611,7 @@ class SearchMangaPlugin(Star):
             return 100
 
     def _group_setting(self, event: AstrMessageEvent) -> dict | None:
-        group_id = event.get_group_id()
-        if not group_id:
-            return None
-        group_id = str(group_id).strip()
-        settings = self.config.get("group_settings", []) or []
-        if not isinstance(settings, list):
-            return None
-        for item in settings:
-            if not isinstance(item, dict):
-                continue
-            template_key = item.get("__template_key") or item.get("template")
-            if template_key and template_key != GROUP_SETTING_TEMPLATE_KEY:
-                continue
-            if str(item.get("group_id", "")).strip() == group_id:
-                return item
-        return None
+        return self._find_group_config_entry(event, "group_settings")
 
     def _send_preview_image(self, event: AstrMessageEvent) -> bool:
         default = _coerce_bool(self.config.get("send_preview_image", True), True)
@@ -1250,12 +1266,14 @@ class SearchMangaPlugin(Star):
         silent_if_ignored: bool = True,
         require_download_permission_for_files: bool = True,
     ):
+        output_fmt = self._output_format()
+        nsfw_policy = self._nsfw_policy(event)
+        allow_file = not require_download_permission_for_files or self._allow_download(event)
+        download_file_flag = (output_fmt in {OUTPUT_FORMAT_ZIP, OUTPUT_FORMAT_PDF}) and allow_file
+        effective_fmt = output_fmt if download_file_flag or output_fmt == OUTPUT_FORMAT_MERGE else OUTPUT_FORMAT_MERGE
+
         for target in targets[:3]:
             source = source_from_url(target)
-            output_fmt = self._output_format()
-            allow_file = not require_download_permission_for_files or self._allow_download(event)
-            download_file_flag = (output_fmt in {OUTPUT_FORMAT_ZIP, OUTPUT_FORMAT_PDF}) and allow_file
-            effective_fmt = output_fmt if download_file_flag or output_fmt == OUTPUT_FORMAT_MERGE else OUTPUT_FORMAT_MERGE
 
             try:
                 media = await parse_media_target(
@@ -1269,7 +1287,7 @@ class SearchMangaPlugin(Star):
                     output_format=effective_fmt,
                     preview_count=self._preview_count(),
                     max_pages=self._max_pages(),
-                    nsfw_policy=self._nsfw_policy(),
+                    nsfw_policy=nsfw_policy,
                     iwara_cookie=self._iwara_cookie(),
                     video_quality=self._iwara_video_quality(),
                     iwara_max_size_mb=self._iwara_max_size_mb(),
@@ -1290,14 +1308,14 @@ class SearchMangaPlugin(Star):
                     continue
 
                 if self._render_parse_card():
-                    card_path = render_info_card(media, nsfw_policy=self._nsfw_policy())
+                    card_path = render_info_card(media, nsfw_policy=nsfw_policy)
 
                 summary_text = self._format_parse_text_summary(media)
                 if card_path is None:
                     safe_cover = apply_nsfw_to_cover(
                         media.cover_bytes,
                         is_nsfw=media.is_nsfw,
-                        nsfw_policy=self._nsfw_policy(),
+                        nsfw_policy=nsfw_policy,
                     )
                     if safe_cover:
                         cover_tmp_path = temp_root() / f"cover_{uuid.uuid4().hex[:8]}.jpg"

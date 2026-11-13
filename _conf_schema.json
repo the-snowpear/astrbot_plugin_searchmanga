@@ -220,11 +220,37 @@
     "default": 200
   },
   "nsfw_policy": {
-    "description": "R18 / NSFW 封面与预览图处理策略",
+    "description": "默认 R18 / NSFW 封面与预览图处理策略",
     "type": "string",
-    "hint": "send=正常发送；blur=高斯模糊处理后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 内容则直接忽略）",
+    "hint": "send=正常发送；blur=高斯模糊处理后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 内容则直接忽略）。可在下方列表中为指定群单独覆盖。",
     "options": ["send", "blur", "ignore"],
     "default": "send"
+  },
+  "nsfw_group_settings": {
+    "description": "按群单独配置 R18 / NSFW 处理策略",
+    "type": "template_list",
+    "hint": "列表内命中的群优先使用其单独策略；未列出的群与私聊回退到上方的默认策略。",
+    "templates": {
+      "group": {
+        "name": "群聊 NSFW 策略",
+        "items": {
+          "group_id": {
+            "description": "QQ群号",
+            "type": "string",
+            "hint": "填写需要单独配置的群号，例如 123456789。",
+            "default": ""
+          },
+          "nsfw_policy": {
+            "description": "NSFW 处理策略",
+            "type": "string",
+            "hint": "send=正常发送；blur=高斯模糊后再发送；ignore=隐藏封面/预览（对 Iwara Ecchi 直接忽略）",
+            "options": ["send", "blur", "ignore"],
+            "default": "blur"
+          }
+        }
+      }
+    },
+    "default": []
   },
   "render_parse_card": {
     "description": "解析结果渲染可视化信息卡片",

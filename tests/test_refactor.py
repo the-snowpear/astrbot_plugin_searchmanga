@@ -712,6 +712,55 @@ class TestRefactorSuite(unittest.TestCase):
         import shutil
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
+    def test_nsfw_policy_per_group_overrides_and_default_fallback(self):
+        plugin = main_mod.SearchMangaPlugin(
+            context=object(),
+            config={
+                "nsfw_policy": "send",
+                "nsfw_group_settings": [
+                    {"group_id": "123456", "nsfw_policy": "blur"},
+                    {"__template_key": "group", "group_id": "654321", "nsfw_policy": "ignore"},
+                ],
+                "group_settings": [
+                    {"group_id": "777888", "nsfw_policy": "blur"},
+                ],
+                "render_parse_card": False,
+                "output_format": "merge",
+            },
+        )
+        self.assertEqual(plugin._nsfw_policy(_DummyEvent(group_id="123456")), "blur")
+        self.assertEqual(plugin._nsfw_policy(_DummyEvent(group_id="654321")), "ignore")
+        self.assertEqual(plugin._nsfw_policy(_DummyEvent(group_id="777888")), "blur")
+        self.assertEqual(plugin._nsfw_policy(_DummyEvent(group_id="999999")), "send")
+        self.assertEqual(plugin._nsfw_policy(_DummyEvent(group_id="")), "send")
+        self.assertEqual(plugin._nsfw_policy(None), "send")
+
+        captured_policies = []
+
+        async def _fake_parse(target, **kwargs):
+            captured_policies.append(kwargs.get("nsfw_policy"))
+            return main_mod.ParsedMedia(
+                platform="iwara",
+                title="Test",
+                url=target,
+                ignored_reason="ignored" if kwargs.get("nsfw_policy") == "ignore" else "",
+            )
+
+        async def _run_parse():
+            with patch.object(main_mod, "parse_media_target", side_effect=_fake_parse):
+                ev_blur = _DummyEvent(group_id="123456")
+                [r async for r in plugin._parse_and_send(ev_blur, ["https://www.iwara.tv/video/abc"], silent_if_ignored=False)]
+
+                ev_ignore = _DummyEvent(group_id="654321")
+                res_ig = [r async for r in plugin._parse_and_send(ev_ignore, ["https://www.iwara.tv/video/abc"], silent_if_ignored=False)]
+
+                ev_default = _DummyEvent(group_id="888000")
+                [r async for r in plugin._parse_and_send(ev_default, ["https://www.iwara.tv/video/abc"], silent_if_ignored=False)]
+            self.assertTrue(any("ignored" in str(r.payload) for r in res_ig))
+
+        asyncio.run(_run_parse())
+        self.assertEqual(captured_policies, ["blur", "ignore", "send"])
+
     def test_packaging_zip_pdf_and_prepare_send_file(self):
         tmp_dir = Path(packaging.temp_root()) / "test_pkg_suite"
         tmp_dir.mkdir(parents=True, exist_ok=True)
