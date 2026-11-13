@@ -188,7 +188,7 @@ Configure these settings in the AstrBot WebUI under **Plugin Configuration**:
 | `file_callback_base` | `string`| `""` | Base URL for OneBot client to access AstrBot files (e.g., `http://192.168.1.100:6185`). |
 | `group_settings` | `list` | `[]` | Per-group overrides for preview images and download permissions. |
 | `auto_parse_enabled` | `bool` | `true` | Auto-parse JM / E-Hentai / ExHentai / nHentai / Iwara / Panda links and JM IDs in messages. |
-| `output_format` | `string` | `"zip"` | Output format: `zip`, `pdf`, or `merge` (info card + preview forward). |
+| `output_format` | `string` | `"zip"` | Output format for search downloads (`下载第N个` / `/下载本子`) & link parser: `zip`, `pdf`, or `merge` (info card + preview forward). |
 | `preview_count` | `int` | `3` | Maximum preview pages attached in `merge` mode. |
 | `max_pages` | `int` | `200` | Maximum page limit for full downloads (`0` for unlimited). |
 | `nsfw_policy` | `string` | `"send"` | Global default R18 cover/preview handling (both `/搜本子` search previews & link parser): `send`, `blur`, or `ignore`. |

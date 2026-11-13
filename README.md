@@ -178,7 +178,7 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | `file_callback_base` | `string` | `""` | 协议端访问 AstrBot 文件的基础 URL（如 `http://192.168.1.100:6185`） |
 | `group_settings` | `list` | `[]` | 群聊个性化独立设置列表 |
 | `auto_parse_enabled` | `bool` | `true` | 是否自动解析聊天中的 JM/EH/ExHentai/nHentai/Iwara/Panda 链接与 JM 号 |
-| `output_format` | `string` | `"zip"` | 下载与解析输出格式：`zip` / `pdf` / `merge`（卡片+预览图合并转发） |
+| `output_format` | `string` | `"zip"` | 搜索后下载（`下载第N个` / `/下载本子`）与链接解析输出格式：`zip` / `pdf` / `merge`（卡片+预览图合并转发） |
 | `preview_count` | `int` | `3` | `merge` 模式展示的最大预览页数 |
 | `max_pages` | `int` | `200` | 单本下载页数上限（超过则只发元数据卡片，0 为不限制） |
 | `nsfw_policy` | `string` | `"send"` | 全局默认 NSFW/Ecchi 封面与预览策略（含 `/搜本子` 预览图与链接解析）：`send` / `blur`（高斯模糊） / `ignore` |

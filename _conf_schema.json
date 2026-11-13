@@ -203,7 +203,7 @@
   "output_format": {
     "description": "下载/解析输出格式",
     "type": "string",
-    "hint": "zip=发送 ZIP 压缩包；pdf=打包为 PDF 文件；merge=仅发送详情卡片与前几页预览图（合并转发）",
+    "hint": "同时作用于搜索后下载（下载第N个 / /下载本子）与链接解析：zip=发送 ZIP 压缩包；pdf=打包为 PDF 文件；merge=发送详情卡片与前几页预览图（合并转发）",
     "options": ["zip", "pdf", "merge"],
     "default": "zip"
   },

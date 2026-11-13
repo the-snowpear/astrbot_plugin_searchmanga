@@ -948,6 +948,116 @@ class TestRefactorSuite(unittest.TestCase):
 
         asyncio.run(_run())
 
+    def test_search_download_output_formats_zip_pdf_and_merge(self):
+        tmp_dir = Path(packaging.temp_root()) / "test_search_dl_formats"
+        tmp_dir.mkdir(parents=True, exist_ok=True)
+        entry = main_mod.SearchEntry(
+            index=1,
+            title="MultiFmtBook",
+            source="ehentai",
+            url="https://e-hentai.org/g/555666/aabbccddee/",
+            alternatives=[("nhentai", "https://nhentai.net/g/777888/")],
+        )
+
+        async def _run():
+            # 1. PDF output format on search download
+            plugin_pdf = main_mod.SearchMangaPlugin(
+                context=object(),
+                config={"output_format": "pdf", "parse_arbiter": False},
+            )
+            plugin_pdf._remember_search(_DummyEvent(sender_id="10", group_id="G1"), [entry])
+            pdf_formats = []
+            sent_files = []
+
+            async def _fake_dl_pdf(url, **kwargs):
+                pdf_formats.append(kwargs.get("output_format"))
+                p1 = tmp_dir / "p1.png"
+                p1.write_bytes(_make_png_bytes((30, 120, 200)))
+                return packaging.images_to_pdf([p1], "MultiFmtBook")
+
+            async def _fake_send_file(ev, fname, fpath):
+                sent_files.append((fname, fpath))
+                return True, "test"
+
+            ev_pdf = _DummyEvent(text="下载第1个", sender_id="10", group_id="G1")
+            intent = parsing.parse_download_intent(ev_pdf.get_message_str())
+            with (
+                patch.object(main_mod, "download_gallery", side_effect=_fake_dl_pdf),
+                patch.object(plugin_pdf, "_send_download_file", side_effect=_fake_send_file),
+                patch.object(main_mod, "get_astrbot_temp_path", return_value=str(tmp_dir)),
+            ):
+                res_pdf = [r async for r in plugin_pdf._do_download(ev_pdf, intent)]
+            self.assertEqual(pdf_formats, ["pdf"])
+            self.assertTrue(sent_files[0][0].endswith(".pdf"))
+            self.assertTrue(any("文件已发送" in str(r.payload) for r in res_pdf))
+
+            # 2. Merge output format on search download with source fallback & per-group NSFW blur
+            plugin_merge = main_mod.SearchMangaPlugin(
+                context=object(),
+                config={
+                    "output_format": "merge",
+                    "preview_count": 2,
+                    "render_parse_card": False,
+                    "nsfw_policy": "send",
+                    "nsfw_group_settings": [{"group_id": "G_BLUR", "nsfw_policy": "blur"}],
+                    "parse_arbiter": False,
+                },
+            )
+            plugin_merge._remember_search(_DummyEvent(sender_id="20", group_id="G_BLUR"), [entry])
+            parse_calls = []
+
+            async def _fake_parse_target(target_url, **kwargs):
+                parse_calls.append((target_url, kwargs))
+                if "e-hentai.org" in target_url:
+                    raise RuntimeError("eh unavailable")
+                work_dir = Path(packaging.temp_root()) / "test_merge_dl_work"
+                work_dir.mkdir(parents=True, exist_ok=True)
+                p_prev = work_dir / "00001_blur.jpg"
+                p_prev.write_bytes(packaging.blur_image_bytes(_make_png_bytes((200, 30, 30))))
+                return main_mod.ParsedMedia(
+                    platform="nhentai",
+                    title="MultiFmtBook",
+                    url=target_url,
+                    cover_bytes=_make_png_bytes((150, 50, 50)),
+                    image_paths=[p_prev],
+                    page_count=24,
+                    is_nsfw=True,
+                    work_dir=str(work_dir),
+                )
+
+            ev_merge = _DummyEvent(text="下载第1个", sender_id="20", group_id="G_BLUR", message_obj=types.SimpleNamespace(message=[], raw_message=None, self_id="99999", message_id="2002"))
+            collected = []
+            with (
+                patch.object(main_mod, "parse_media_target", side_effect=_fake_parse_target),
+                patch.object(main_mod, "download_gallery", AsyncMock()) as mocked_dl,
+            ):
+                async for r in plugin_merge._do_download(ev_merge, intent):
+                    collected.append(r)
+                    if isinstance(r.payload, list) and r.payload and hasattr(r.payload[0], "nodes"):
+                        fwd_nodes = r.payload[0].nodes
+                        self.assertEqual(len(fwd_nodes), 2)
+                        self.assertTrue(r.stopped)
+                        prev_imgs = [c for c in fwd_nodes[1].content if isinstance(c, Comp.Image)]
+                        self.assertEqual(len(prev_imgs), 1)
+                        self.assertTrue(Path(prev_imgs[0].path).exists())
+                mocked_dl.assert_not_awaited()
+
+            self.assertEqual(
+                [u for u, _ in parse_calls],
+                ["https://e-hentai.org/g/555666/aabbccddee/", "https://nhentai.net/g/777888/"],
+            )
+            self.assertEqual(parse_calls[1][1].get("output_format"), "merge")
+            self.assertEqual(parse_calls[1][1].get("nsfw_policy"), "blur")
+            self.assertFalse(parse_calls[1][1].get("download_gallery_file"))
+            self.assertTrue(any(isinstance(r.payload, list) and r.payload and hasattr(r.payload[0], "nodes") for r in collected))
+            self.assertFalse((Path(packaging.temp_root()) / "test_merge_dl_work").exists())
+
+        try:
+            asyncio.run(_run())
+        finally:
+            import shutil
+            shutil.rmtree(tmp_dir, ignore_errors=True)
+
 
 if __name__ == "__main__":
     unittest.main()

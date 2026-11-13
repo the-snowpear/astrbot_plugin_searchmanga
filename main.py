@@ -1142,12 +1142,9 @@ class SearchMangaPlugin(Star):
             return True
         return self._recent_search_entry(event, intent.index) is not None
 
-    def _download_output_format(self) -> str:
-        fmt = self._output_format()
-        return OUTPUT_FORMAT_PDF if fmt == OUTPUT_FORMAT_PDF else OUTPUT_FORMAT_ZIP
-
     async def _do_download(self, event: AstrMessageEvent, intent: DownloadIntent):
-        if event.get_platform_name() != "aiocqhttp":
+        output_fmt = self._output_format()
+        if output_fmt != OUTPUT_FORMAT_MERGE and event.get_platform_name() != "aiocqhttp":
             yield event.plain_result("本插件的文件发送仅支持 QQ (aiocqhttp)。").stop_event()
             return
         if not self._allow_download(event):
@@ -1185,38 +1182,87 @@ class SearchMangaPlugin(Star):
             yield event.plain_result("已跳过重复下载：这条消息的下载任务正在处理或已经处理过。").stop_event()
             return
 
-        logger.info(
-            f"[搜本子下载] 命中下载目标: 标题={target.title}, 来源={candidate_urls[0][0]}, url={candidate_urls[0][1]}"
-        )
-        yield event.plain_result(f"开始下载: {target.title}")
+        async def _try_sources(fetcher, action_label: str):
+            last_error: Exception | None = None
+            for cand_source, cand_url in candidate_urls:
+                try:
+                    return await fetcher(cand_source, cand_url), None
+                except asyncio.TimeoutError as exc:
+                    last_error = exc
+                except Exception as exc:
+                    last_error = exc
+                    logger.warning(f"[搜本子下载] {action_label}失败 ({cand_source} / {cand_url}): {exc}")
+            return None, last_error
 
-        dl_format = self._download_output_format()
-        downloaded = None
-        last_exc: Exception | None = None
-        for cand_source, cand_url in candidate_urls:
-            try:
-                downloaded = await download_gallery(
+        if output_fmt == OUTPUT_FORMAT_MERGE:
+            logger.info(
+                f"[搜本子下载] 命中合并转发目标: 标题={target.title}, 来源={candidate_urls[0][0]}, url={candidate_urls[0][1]}"
+            )
+            yield event.plain_result(f"开始获取合并转发内容: {target.title}")
+            nsfw_policy = self._nsfw_policy(event)
+            merged_media, last_exc = await _try_sources(
+                lambda cand_source, cand_url: parse_media_target(
                     cand_url,
                     timeout=self._download_timeout(),
                     concurrency=self._download_concurrency(),
                     ehentai_cookie=self._ehentai_cookie(),
                     exhentai_cookie=self._exhentai_cookie(),
-                    prefer_archive=self._prefer_archive_download(),
+                    prefer_archive=False,
                     proxy=self._proxy_for("download", cand_source),
-                    output_format=dl_format,
+                    output_format=OUTPUT_FORMAT_MERGE,
+                    preview_count=self._preview_count(),
                     max_pages=self._max_pages(),
+                    nsfw_policy=nsfw_policy,
                     iwara_cookie=self._iwara_cookie(),
                     video_quality=self._iwara_video_quality(),
                     iwara_max_size_mb=self._iwara_max_size_mb(),
-                )
-                break
-            except asyncio.TimeoutError as exc:
-                last_exc = exc
-                continue
-            except Exception as exc:
-                last_exc = exc
-                logger.warning(f"[搜本子下载] 尝试下载源失败 ({cand_source} / {cand_url}): {exc}")
-                continue
+                    download_gallery_file=False,
+                ),
+                "尝试合并转发源",
+            )
+            if merged_media is None:
+                if isinstance(last_exc, asyncio.TimeoutError):
+                    yield event.plain_result("获取合并转发超时，请稍后重试或调大 download_timeout。").stop_event()
+                else:
+                    logger.exception("本子合并转发获取失败")
+                    yield event.plain_result(f"获取合并转发失败: {last_exc}").stop_event()
+                return
+
+            async for res in self._deliver_parsed_media(
+                event,
+                merged_media,
+                target.url,
+                nsfw_policy=nsfw_policy,
+                allow_file=False,
+                silent_if_ignored=False,
+                stop_event_on_delivery=True,
+            ):
+                yield res
+            return
+
+        logger.info(
+            f"[搜本子下载] 命中下载目标: 标题={target.title}, 来源={candidate_urls[0][0]}, url={candidate_urls[0][1]}"
+        )
+        yield event.plain_result(f"开始下载: {target.title}")
+
+        dl_format = OUTPUT_FORMAT_PDF if output_fmt == OUTPUT_FORMAT_PDF else OUTPUT_FORMAT_ZIP
+        downloaded, last_exc = await _try_sources(
+            lambda cand_source, cand_url: download_gallery(
+                cand_url,
+                timeout=self._download_timeout(),
+                concurrency=self._download_concurrency(),
+                ehentai_cookie=self._ehentai_cookie(),
+                exhentai_cookie=self._exhentai_cookie(),
+                prefer_archive=self._prefer_archive_download(),
+                proxy=self._proxy_for("download", cand_source),
+                output_format=dl_format,
+                max_pages=self._max_pages(),
+                iwara_cookie=self._iwara_cookie(),
+                video_quality=self._iwara_video_quality(),
+                iwara_max_size_mb=self._iwara_max_size_mb(),
+            ),
+            "尝试下载源",
+        )
 
         if downloaded is None:
             if isinstance(last_exc, asyncio.TimeoutError):
@@ -1334,6 +1380,117 @@ class SearchMangaPlugin(Star):
             lines.append(f"说明: {media.skipped_download_reason}")
         return "\n".join(lines)
 
+    async def _deliver_parsed_media(
+        self,
+        event: AstrMessageEvent,
+        media: ParsedMedia,
+        target_label: str,
+        *,
+        nsfw_policy: str,
+        allow_file: bool,
+        silent_if_ignored: bool = True,
+        stop_event_on_delivery: bool = False,
+    ):
+        """发送 ParsedMedia（卡片 / 合并转发预览 / 视频 / ZIP / PDF）并清理临时文件。"""
+        def _maybe_stop(result):
+            if stop_event_on_delivery and hasattr(result, "stop_event"):
+                return result.stop_event()
+            return result
+
+        card_path: Path | None = None
+        cover_tmp_path: Path | None = None
+        try:
+            if media.ignored_reason:
+                if not silent_if_ignored:
+                    yield _maybe_stop(event.plain_result(media.ignored_reason))
+                return
+
+            if self._render_parse_card():
+                card_path = render_info_card(media, nsfw_policy=nsfw_policy)
+
+            summary_text = self._format_parse_text_summary(media)
+            if card_path is None:
+                safe_cover = apply_nsfw_to_cover(
+                    media.cover_bytes,
+                    is_nsfw=media.is_nsfw,
+                    nsfw_policy=nsfw_policy,
+                )
+                if safe_cover:
+                    cover_tmp_path = temp_root() / f"cover_{uuid.uuid4().hex[:8]}.jpg"
+                    cover_tmp_path.write_bytes(safe_cover)
+
+            # Merge 转发模式（或仅预览 / 无文件）
+            if media.image_paths and not media.file_path and not media.video_path and event.get_platform_name() == "aiocqhttp":
+                node_uin = self._node_uin(event)
+                intro_content: list[Any] = []
+                if card_path:
+                    intro_content.append(Comp.Image.fromFileSystem(str(card_path)))
+                elif cover_tmp_path:
+                    intro_content.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
+                if media.skipped_download_reason or card_path is None:
+                    intro_content.append(Comp.Plain(summary_text))
+                nodes = [Comp.Node(uin=node_uin, name=self._node_name(), content=intro_content)]
+                for img_p in media.image_paths:
+                    nodes.append(
+                        Comp.Node(
+                            uin=node_uin,
+                            name=self._node_name(),
+                            content=[Comp.Image.fromFileSystem(str(img_p))],
+                        )
+                    )
+                yield _maybe_stop(event.chain_result([Comp.Nodes(nodes)]))
+                return
+
+            # 卡片 / 文本摘要
+            if card_path:
+                card_chain: list[Any] = [Comp.Image.fromFileSystem(str(card_path))]
+                if media.skipped_download_reason:
+                    card_chain.append(Comp.Plain(f"\n{media.skipped_download_reason}"))
+                yield _maybe_stop(event.chain_result(card_chain))
+            else:
+                fallback_chain: list[Any] = []
+                if cover_tmp_path:
+                    fallback_chain.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
+                fallback_chain.append(Comp.Plain(summary_text))
+                yield _maybe_stop(event.chain_result(fallback_chain))
+
+            # 发送 Iwara 视频
+            if media.video_path and Path(media.video_path).exists():
+                video_cls = getattr(Comp, "Video", None)
+                sent_video = False
+                if video_cls and hasattr(video_cls, "fromFileSystem"):
+                    try:
+                        yield _maybe_stop(event.chain_result([video_cls.fromFileSystem(media.video_path)]))
+                        sent_video = True
+                    except Exception as exc:
+                        logger.warning(f"直接发送视频段失败，回退群/私聊文件上传: {exc}")
+                if not sent_video and event.get_platform_name() == "aiocqhttp" and allow_file:
+                    v_name, v_send = _prepare_send_file(media.video_path, media.title)
+                    await self._send_download_file(event, v_name, v_send)
+                return
+
+            # 发送图包 ZIP / PDF 文件
+            if media.file_path and Path(media.file_path).exists() and event.get_platform_name() == "aiocqhttp":
+                f_name, f_send = _prepare_send_file(media.file_path, media.title)
+                await self._send_download_file(event, f_name, f_send)
+        except Exception as exc:
+            logger.exception(f"发送解析结果失败: {target_label}")
+            yield _maybe_stop(event.plain_result(f"解析完成，但结果发送失败: {exc}"))
+        finally:
+            for p in (card_path, cover_tmp_path):
+                if p:
+                    try:
+                        p.unlink(missing_ok=True)
+                    except OSError:
+                        pass
+            if _is_under_dir(media.file_path, temp_root()):
+                try:
+                    Path(media.file_path).unlink(missing_ok=True)  # type: ignore[arg-type]
+                except OSError:
+                    pass
+            if _is_under_dir(media.work_dir, temp_root()):
+                shutil.rmtree(media.work_dir, ignore_errors=True)  # type: ignore[arg-type]
+
     async def _parse_and_send(
         self,
         event: AstrMessageEvent,
@@ -1375,99 +1532,15 @@ class SearchMangaPlugin(Star):
                     yield event.plain_result(f"解析失败 ({target}): {exc}")
                 continue
 
-            card_path: Path | None = None
-            cover_tmp_path: Path | None = None
-            try:
-                if media.ignored_reason:
-                    if not silent_if_ignored:
-                        yield event.plain_result(media.ignored_reason)
-                    continue
-
-                if self._render_parse_card():
-                    card_path = render_info_card(media, nsfw_policy=nsfw_policy)
-
-                summary_text = self._format_parse_text_summary(media)
-                if card_path is None:
-                    safe_cover = apply_nsfw_to_cover(
-                        media.cover_bytes,
-                        is_nsfw=media.is_nsfw,
-                        nsfw_policy=nsfw_policy,
-                    )
-                    if safe_cover:
-                        cover_tmp_path = temp_root() / f"cover_{uuid.uuid4().hex[:8]}.jpg"
-                        cover_tmp_path.write_bytes(safe_cover)
-
-                # Merge 转发模式（或仅预览 / 无文件）
-                if media.image_paths and not media.file_path and not media.video_path and event.get_platform_name() == "aiocqhttp":
-                    node_uin = self._node_uin(event)
-                    intro_content: list[Any] = []
-                    if card_path:
-                        intro_content.append(Comp.Image.fromFileSystem(str(card_path)))
-                    elif cover_tmp_path:
-                        intro_content.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
-                    if media.skipped_download_reason or card_path is None:
-                        intro_content.append(Comp.Plain(summary_text))
-                    nodes = [Comp.Node(uin=node_uin, name=self._node_name(), content=intro_content)]
-                    for img_p in media.image_paths:
-                        nodes.append(
-                            Comp.Node(
-                                uin=node_uin,
-                                name=self._node_name(),
-                                content=[Comp.Image.fromFileSystem(str(img_p))],
-                            )
-                        )
-                    yield event.chain_result([Comp.Nodes(nodes)])
-                    continue
-
-                # 卡片 / 文本摘要
-                if card_path:
-                    card_chain: list[Any] = [Comp.Image.fromFileSystem(str(card_path))]
-                    if media.skipped_download_reason:
-                        card_chain.append(Comp.Plain(f"\n{media.skipped_download_reason}"))
-                    yield event.chain_result(card_chain)
-                else:
-                    fallback_chain: list[Any] = []
-                    if cover_tmp_path:
-                        fallback_chain.append(Comp.Image.fromFileSystem(str(cover_tmp_path)))
-                    fallback_chain.append(Comp.Plain(summary_text))
-                    yield event.chain_result(fallback_chain)
-
-                # 发送 Iwara 视频
-                if media.video_path and Path(media.video_path).exists():
-                    video_cls = getattr(Comp, "Video", None)
-                    sent_video = False
-                    if video_cls and hasattr(video_cls, "fromFileSystem"):
-                        try:
-                            yield event.chain_result([video_cls.fromFileSystem(media.video_path)])
-                            sent_video = True
-                        except Exception as exc:
-                            logger.warning(f"直接发送视频段失败，回退群/私聊文件上传: {exc}")
-                    if not sent_video and event.get_platform_name() == "aiocqhttp" and allow_file:
-                        v_name, v_send = _prepare_send_file(media.video_path, media.title)
-                        await self._send_download_file(event, v_name, v_send)
-                    continue
-
-                # 发送图包 ZIP / PDF 文件
-                if media.file_path and Path(media.file_path).exists() and event.get_platform_name() == "aiocqhttp":
-                    f_name, f_send = _prepare_send_file(media.file_path, media.title)
-                    await self._send_download_file(event, f_name, f_send)
-            except Exception as exc:
-                logger.exception(f"发送解析结果失败: {target}")
-                yield event.plain_result(f"解析完成，但结果发送失败: {exc}")
-            finally:
-                for p in (card_path, cover_tmp_path):
-                    if p:
-                        try:
-                            p.unlink(missing_ok=True)
-                        except OSError:
-                            pass
-                if _is_under_dir(media.file_path, temp_root()):
-                    try:
-                        Path(media.file_path).unlink(missing_ok=True)  # type: ignore[arg-type]
-                    except OSError:
-                        pass
-                if _is_under_dir(media.work_dir, temp_root()):
-                    shutil.rmtree(media.work_dir, ignore_errors=True)  # type: ignore[arg-type]
+            async for res in self._deliver_parsed_media(
+                event,
+                media,
+                target,
+                nsfw_policy=nsfw_policy,
+                allow_file=allow_file,
+                silent_if_ignored=silent_if_ignored,
+            ):
+                yield res
 
     async def _do_search(
         self,
