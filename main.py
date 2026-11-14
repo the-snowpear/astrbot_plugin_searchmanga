@@ -70,6 +70,11 @@ PARSE_HANDLED_EXTRA = "searchmanga_parse_handled"
 DEFAULT_BASE64_FILE_LIMIT_MB = 48
 DEFAULT_STREAM_CHUNK_KB = 256
 STREAM_FILE_RETENTION_MS = 5 * 60 * 1000
+# LLM 工具调用（call_local_llm_tool）会先把异步生成器消费完，再在工具返回后
+# 才真正读取图片文件；因此临时卡片/预览图不能在被 yield 之后立刻删除，
+# 否则会出现 "image file URI does not point to an existing file"。
+TEMP_FILE_GRACE_SECONDS = 600
+TEMP_FILE_SWEEP_INTERVAL = 30
 ZIP_MAGIC_PREFIXES = (b"PK\x03\x04", b"PK\x05\x06", b"PK\x07\x08")
 PDF_MAGIC_PREFIX = b"%PDF-"
 GROUP_SETTING_TEMPLATE_KEY = "group"
@@ -390,6 +395,73 @@ class SearchMangaPlugin(Star):
         self._parse_debounce: dict[str, float] = {}
         self._session_parse_overrides: dict[str, bool] = {}
         self._arbiter = EmojiLikeArbiter()
+        # 延迟清理队列：path -> 到期时间戳。用于修复 LLM 工具调用路径下
+        # 异步生成器被“先消费完、后发送”导致的临时图片提前删除问题。
+        self._deferred_cleanup: dict[str, float] = {}
+        self._cleanup_task: asyncio.Task | None = None
+
+    def _cleanup_grace_seconds(self) -> float:
+        try:
+            value = float(self.config.get("cleanup_grace_seconds", TEMP_FILE_GRACE_SECONDS))
+        except (TypeError, ValueError):
+            return float(TEMP_FILE_GRACE_SECONDS)
+        return max(30.0, value)
+
+    def _ensure_cleanup_task(self) -> None:
+        task = self._cleanup_task
+        if task is not None and not task.done():
+            return
+        try:
+            loop = asyncio.get_running_loop()
+        except RuntimeError:
+            return
+        self._cleanup_task = loop.create_task(self._cleanup_loop())
+
+    async def _cleanup_loop(self) -> None:
+        try:
+            while True:
+                await asyncio.sleep(TEMP_FILE_SWEEP_INTERVAL)
+                self._sweep_deferred_cleanup()
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            logger.debug("搜本子临时文件清理循环异常退出", exc_info=True)
+
+    def _defer_cleanup(self, *targets: str | Path | None, ttl: float | None = None) -> None:
+        """把临时文件/目录延迟 ttl 秒后删除，保留发送窗口。"""
+        deadline = time.time() + (self._cleanup_grace_seconds() if ttl is None else ttl)
+        for target in targets:
+            if not target:
+                continue
+            path_str = str(target)
+            if not _is_under_dir(path_str, temp_root()):
+                # 只清理插件自己的临时目录，绝不碰下载到用户目录的文件。
+                continue
+            try:
+                key = str(Path(path_str).resolve())
+            except OSError:
+                key = path_str
+            self._deferred_cleanup[key] = deadline
+        self._sweep_deferred_cleanup()
+        if self._deferred_cleanup:
+            self._ensure_cleanup_task()
+
+    def _sweep_deferred_cleanup(self) -> None:
+        if not self._deferred_cleanup:
+            return
+        now = time.time()
+        for key in [k for k, expire_at in self._deferred_cleanup.items() if expire_at <= now]:
+            self._deferred_cleanup.pop(key, None)
+            path = Path(key)
+            try:
+                if path.is_dir():
+                    shutil.rmtree(path, ignore_errors=True)
+                    logger.debug(f"清理搜本子临时目录: {key}")
+                else:
+                    path.unlink(missing_ok=True)
+                    logger.debug(f"清理搜本子临时文件: {key}")
+            except OSError:
+                logger.debug(f"清理搜本子临时文件失败: {key}", exc_info=True)
 
     def _cleanup_download_files(self) -> None:
         now = time.time()
@@ -600,6 +672,10 @@ class SearchMangaPlugin(Star):
 
     def _render_parse_card(self) -> bool:
         return _coerce_bool(self.config.get("render_parse_card", True), True)
+
+    def _card_font_path(self) -> str | None:
+        value = str(self.config.get("card_font_path", "") or "").strip()
+        return value or None
 
     def _iwara_cookie(self) -> str:
         return str(self.config.get("iwara_cookie", "") or "")
@@ -1279,11 +1355,8 @@ class SearchMangaPlugin(Star):
             yield event.plain_result(f"下载完成，但文件校验失败: {exc}").stop_event()
             return
         finally:
-            if _is_under_dir(downloaded.zip_path, temp_root()):
-                try:
-                    Path(downloaded.zip_path).unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # 同上：延迟清理，避免工具调用路径下发送前文件已消失。
+            self._defer_cleanup(downloaded.zip_path)
 
         try:
             sent, mode = await self._send_download_file(event, file_name, send_path)
@@ -1406,7 +1479,11 @@ class SearchMangaPlugin(Star):
                 return
 
             if self._render_parse_card():
-                card_path = render_info_card(media, nsfw_policy=nsfw_policy)
+                card_path = render_info_card(
+                    media,
+                    nsfw_policy=nsfw_policy,
+                    font_path=self._card_font_path(),
+                )
 
             summary_text = self._format_parse_text_summary(media)
             if card_path is None:
@@ -1477,19 +1554,18 @@ class SearchMangaPlugin(Star):
             logger.exception(f"发送解析结果失败: {target_label}")
             yield _maybe_stop(event.plain_result(f"解析完成，但结果发送失败: {exc}"))
         finally:
-            for p in (card_path, cover_tmp_path):
-                if p:
-                    try:
-                        p.unlink(missing_ok=True)
-                    except OSError:
-                        pass
-            if _is_under_dir(media.file_path, temp_root()):
-                try:
-                    Path(media.file_path).unlink(missing_ok=True)  # type: ignore[arg-type]
-                except OSError:
-                    pass
-            if _is_under_dir(media.work_dir, temp_root()):
-                shutil.rmtree(media.work_dir, ignore_errors=True)  # type: ignore[arg-type]
+            # 这里必须延迟清理：LLM 工具路径（AstrBot call_local_llm_tool）会先把
+            # 异步生成器整体消费完，再在工具返回后由 event.send(...) 读取图片文件。
+            # 若在 yield 之后立刻删除，卡片图/合并转发预览图就会变成
+            # "image file URI does not point to an existing file"。
+            # 纯指令路径由 RespondStage 边 yield 边发图，同样兼容延迟清理。
+            self._defer_cleanup(
+                card_path,
+                cover_tmp_path,
+                media.file_path,
+                media.video_path,
+                media.work_dir,
+            )
 
     async def _parse_and_send(
         self,
@@ -1619,11 +1695,8 @@ class SearchMangaPlugin(Star):
             if stop_agent_after_result:
                 event.set_extra("agent_stop_requested", True)
         finally:
-            for p in blurred_paths.values():
-                try:
-                    p.unlink(missing_ok=True)
-                except OSError:
-                    pass
+            # 模糊预览图写在 Component 里，发送时才真正读盘，因此同样延迟清理。
+            self._defer_cleanup(*blurred_paths.values())
 
     @filter.event_message_type(filter.EventMessageType.ALL)
     async def cache_recent_image(self, event: AstrMessageEvent):
@@ -1804,4 +1877,16 @@ class SearchMangaPlugin(Star):
             yield r
 
     async def terminate(self):
-        pass
+        task = self._cleanup_task
+        self._cleanup_task = None
+        if task is not None and not task.done():
+            task.cancel()
+            try:
+                await task
+            except asyncio.CancelledError:
+                pass
+            except Exception:
+                logger.debug("停止搜本子临时文件清理任务失败", exc_info=True)
+        # 插件卸载时立即清理全部延迟队列
+        self._deferred_cleanup = {key: 0.0 for key in self._deferred_cleanup}
+        self._sweep_deferred_cleanup()

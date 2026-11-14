@@ -944,6 +944,13 @@ class TestRefactorSuite(unittest.TestCase):
                     },
                 )
                 self.assertEqual(len(seen_blur_paths), 1)
+                # 延迟清理：生成器结束（LLM 工具路径下发图在之后）时文件必须仍在，
+                # 但已经进入延迟清理队列，到点后由 _sweep_deferred_cleanup 删除。
+                self.assertTrue(seen_blur_paths[0].exists())
+                self.assertIn(str(seen_blur_paths[0].resolve()), plugin._deferred_cleanup)
+                for key in list(plugin._deferred_cleanup):
+                    plugin._deferred_cleanup[key] = 0.0
+                plugin._sweep_deferred_cleanup()
                 self.assertFalse(seen_blur_paths[0].exists())
 
         asyncio.run(_run())
@@ -1050,7 +1057,14 @@ class TestRefactorSuite(unittest.TestCase):
             self.assertEqual(parse_calls[1][1].get("nsfw_policy"), "blur")
             self.assertFalse(parse_calls[1][1].get("download_gallery_file"))
             self.assertTrue(any(isinstance(r.payload, list) and r.payload and hasattr(r.payload[0], "nodes") for r in collected))
-            self.assertFalse((Path(packaging.temp_root()) / "test_merge_dl_work").exists())
+            merge_work_dir = Path(packaging.temp_root()) / "test_merge_dl_work"
+            # 工作目录同样是延迟清理：生成器结束后仍在，避免 LLM 工具路径发送时预览图丢失。
+            self.assertTrue(merge_work_dir.exists())
+            self.assertIn(str(merge_work_dir.resolve()), plugin_merge._deferred_cleanup)
+            for key in list(plugin_merge._deferred_cleanup):
+                plugin_merge._deferred_cleanup[key] = 0.0
+            plugin_merge._sweep_deferred_cleanup()
+            self.assertFalse(merge_work_dir.exists())
 
         try:
             asyncio.run(_run())

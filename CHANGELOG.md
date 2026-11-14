@@ -4,6 +4,18 @@
 
 ---
 
+## [0.3.1] - 2026-11-14
+
+### 🐛 修复 (Fixed)
+- **修复信息卡片中日文全渲染成方块 □**：`soulter/astrbot:latest` 镜像内只有 DejaVu / Liberation / NotoMono 等纯西文字体，旧 `_FONT_CANDIDATES` 把 `DejaVuSans.ttf` 当候选，Pillow 便用它画汉字，结果全是 `.notdef` 方块。现在改为**按字形覆盖度挑字体**：用 `.notdef`（U+FFFF）位图做基准，逐个字体验证「作 / 者 / 页 / 链」与假名，缺失核心中文字形的字体直接判 0 分；候选来源扩展为 `SEARCHMANGA_FONT_PATH` 环境变量 → `data/fonts` → 系统 `/usr/share/fonts` 等目录 → 同级插件自带字体，并新增 `card_font_path` 配置项。一个中日文字体都没有时会回退纯文本摘要并打一条告警，而不是发出满屏方块。
+- **修复 LLM 工具调用（`download_doujin` / `parse_media_url` 等）路径下临时图片被提前删除**：AstrBot 的 `call_local_llm_tool`（`astrbot/core/astr_agent_tool_exec.py`）用 `iterate_in_task` 先把异步生成器整个消费完，再在工具返回后由 `event.send(...)` 读图片文件；`_deliver_parsed_media` 原来的 `finally` 里立刻 `unlink()` 卡片图、遮挡封面和 `work_dir` 预览图，于是报 `[Errno 2] image file URI does not point to an existing file: '/tmp/astrbot_searchmanga/card_nhentai.png'`。纯指令路径由 RespondStage 边 yield 边发图所以不受影响。现在改为**延迟清理队列**（默认 `cleanup_grace_seconds=600`）：临时文件进入 `_deferred_cleanup`，由 30 秒轮询后台任务到期才删，插件 `terminate()` 时立即清空；`/搜本子` 的模糊预览图与下载 ZIP 同步改用该机制。
+
+### 🔧 变更 (Changed)
+- `_find_font` 增加按 `(路径, 字号)` 的字体对象缓存，`_wrap_lines` 与卡片渲染不再重复 `truetype()`。
+- 卡片元信息不再在 `extra_info` 已含「页数:」时重复追加页数。
+
+---
+
 ## [0.3.0] - 2026-11-13
 
 ### 🚀 新增特性 (Added)

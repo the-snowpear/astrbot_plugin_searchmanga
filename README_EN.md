@@ -190,10 +190,12 @@ Configure these settings in the AstrBot WebUI under **Plugin Configuration**:
 | `auto_parse_enabled` | `bool` | `true` | Auto-parse JM / E-Hentai / ExHentai / nHentai / Iwara / Panda links and JM IDs in messages. |
 | `output_format` | `string` | `"zip"` | Output format for search downloads (`下载第N个` / `/下载本子`) & link parser: `zip`, `pdf`, or `merge` (info card + preview forward). |
 | `preview_count` | `int` | `3` | Maximum preview pages attached in `merge` mode. |
+| `cleanup_grace_seconds` | `int` | `600` | Delay before temporary card/preview files are deleted. LLM tool calls consume the whole async generator before sending, so a too-short delay makes the image vanish before delivery. |
 | `max_pages` | `int` | `200` | Maximum page limit for full downloads (`0` for unlimited). |
 | `nsfw_policy` | `string` | `"send"` | Global default R18 cover/preview handling (both `/搜本子` search previews & link parser): `send`, `blur`, or `ignore`. |
 | `nsfw_group_settings` | `list` | `[]` | Per-group overrides for `nsfw_policy` (both `/搜本子` & link parser); listed groups override the global default. |
 | `render_parse_card` | `bool` | `true` | Render Pillow visual info cards for parse results. |
+| `card_font_path` | `string` | `""` | Optional absolute path to a card font. Empty = auto-pick a font that actually contains CJK glyphs. |
 | `parse_arbiter` | `bool` | `true` | Multi-bot group reaction arbiter to avoid duplicate replies. |
 | `parse_debounce_seconds` | `int` | `10` | Per-session cooldown in seconds for repeated identical targets. |
 | `iwara_cookie` / `iwara_video_quality` / `iwara_max_size_mb` | — | `""` / `"540"` / `100` | Optional Iwara cookie/token, preferred quality, and video size limit (MB). |
@@ -320,7 +322,18 @@ astrbot_plugin_searchmanga/
 #### Q3: ExHentai download returns 403 or fails to parse?
 **Answer**: ExHentai requires valid login cookies. Set `exhentai_cookie` in the plugin configuration (must include `ipb_member_id`, `ipb_pass_hash`, `igneous`, etc.).
 
-#### Q4: Forward messages stopped working after upgrading to Python 3.14?
+#### Q4: Why do CJK titles on the info card render as tofu boxes (□□□)?
+
+**A**: No CJK-capable font is installed. `soulter/astrbot:latest` ships only DejaVu / Liberation, so Pillow falls back to a font without Han/Kana glyphs. Since v0.3.1 the plugin scores glyph coverage and refuses such fonts, but it still needs at least one CJK font on the system:
+
+1. Install in your image: `RUN apt-get update && apt-get install -y fonts-noto-cjk fonts-wqy-zenhei && fc-cache -f`
+2. Or mount host fonts: `- /usr/share/fonts/opentype/noto:/usr/share/fonts/opentype/noto:ro`
+3. Or drop any `.ttf` / `.ttc` / `.otf` into `data/plugins/astrbot_plugin_searchmanga/data/fonts/`.
+4. Or set `card_font_path` (or env `SEARCHMANGA_FONT_PATH`) to an absolute font path.
+
+With no CJK font at all, the plugin falls back to a plain text summary instead of boxes.
+
+#### Q5: Forward messages stopped working after upgrading to Python 3.14?
 **Answer**: This is a known issue in v0.2.0 caused by stricter pydantic v2 validation of `Node.uin`. Upgrade to **v0.2.1**.
 
 ---

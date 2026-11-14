@@ -180,10 +180,12 @@ pip install -r data/plugins/astrbot_plugin_searchmanga/requirements.txt
 | `auto_parse_enabled` | `bool` | `true` | 是否自动解析聊天中的 JM/EH/ExHentai/nHentai/Iwara/Panda 链接与 JM 号 |
 | `output_format` | `string` | `"zip"` | 搜索后下载（`下载第N个` / `/下载本子`）与链接解析输出格式：`zip` / `pdf` / `merge`（卡片+预览图合并转发） |
 | `preview_count` | `int` | `3` | `merge` 模式展示的最大预览页数 |
+| `cleanup_grace_seconds` | `int` | `600` | 卡片图 / 合并转发预览图等临时文件的延迟删除秒数（LLM 工具调用会先消费完异步生成器再发图，过短会导致发送时文件已被删除） |
 | `max_pages` | `int` | `200` | 单本下载页数上限（超过则只发元数据卡片，0 为不限制） |
 | `nsfw_policy` | `string` | `"send"` | 全局默认 NSFW/Ecchi 封面与预览策略（含 `/搜本子` 预览图与链接解析）：`send` / `blur`（高斯模糊） / `ignore` |
 | `nsfw_group_settings` | `list` | `[]` | 按群单独配置 `nsfw_policy`（同时作用于 `/搜本子` 与链接解析）；命中列表的群优先覆盖全局默认策略 |
 | `render_parse_card` | `bool` | `true` | 是否渲染可视化解析信息卡片 |
+| `card_font_path` | `string` | `""` | 可选。卡片字体文件绝对路径；留空则自动挑选含中日文字形的字体 |
 | `parse_arbiter` | `bool` | `true` | 群聊多 Bot 表情仲裁，避免重复刷屏 |
 | `parse_debounce_seconds` | `int` | `10` | 同会话相同目标防抖冷却（秒） |
 | `iwara_cookie` / `iwara_video_quality` / `iwara_max_size_mb` | — | `""` / `"540"` / `100` | Iwara 登录凭证、优先清晰度与视频大小上限 |
@@ -316,7 +318,22 @@ astrbot_plugin_searchmanga/
 
 **答**：里站需要配额有效的 Cookie。请在 `exhentai_cookie` 中填入完整 Cookie 字符串（必须包含 `ipb_member_id`、`ipb_pass_hash`、`igneous` 等字段）。
 
-#### Q4: 升级到 Python 3.14 后，合并转发突然发不出来？
+#### Q4: 信息卡片里的中文 / 日文全是方块 □？
+
+**答**：说明容器里没有可用的中日文字体（`soulter/astrbot:latest` 只自带 DejaVu / Liberation 等纯西文字体）。v0.3.1 起插件会自动按字形覆盖度挑选字体，并把纯西文字体排除，但前提是系统里**至少有一个**中日文字体。可选做法：
+
+1. 自定义镜像里装字体：`RUN apt-get update && apt-get install -y fonts-noto-cjk fonts-wqy-zenhei && fc-cache -f`
+2. 或在 `docker-compose.yml` 挂载宿主机字体目录：
+   ```yaml
+   volumes:
+     - /usr/share/fonts/opentype/noto:/usr/share/fonts/opentype/noto:ro
+   ```
+3. 或把任意 `.ttf` / `.ttc` / `.otf` 放到 `data/plugins/astrbot_plugin_searchmanga/data/fonts/`（插件会自动扫描）。
+4. 或在配置项 `card_font_path`（或环境变量 `SEARCHMANGA_FONT_PATH`）里直接指定字体文件绝对路径。
+
+一个字体都没有时，插件会回退为纯文本摘要，而不是发出满屏方块。
+
+#### Q5: 升级到 Python 3.14 后，合并转发突然发不出来？
 
 **答**：这是 v0.2.0 的已知问题，升级到 **v0.2.1** 即可修复（`Node.uin` 类型转换）。
 

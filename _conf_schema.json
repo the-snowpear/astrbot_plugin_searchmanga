@@ -213,6 +213,12 @@
     "hint": "output_format 为 merge 时或附带预览图时发送的最大预览页数",
     "default": 3
   },
+  "cleanup_grace_seconds": {
+    "description": "临时图片保留时长 (秒)",
+    "type": "int",
+    "hint": "卡片图、合并转发预览图等临时文件发送后延迟删除的等待时长。LLM 工具调用会先消费完异步生成器再发图，过短会导致发送时文件已被删除；默认 600 秒。",
+    "default": 600
+  },
   "max_pages": {
     "description": "单本下载页数上限",
     "type": "int",
@@ -257,6 +263,12 @@
     "type": "bool",
     "hint": "开启后使用 Pillow 生成含封面与元信息的卡片图发送",
     "default": true
+  },
+  "card_font_path": {
+    "description": "卡片字体文件路径（可选）",
+    "type": "string",
+    "hint": "留空则自动挑选含中文/日文字形的字体（Noto CJK / 文泉驿 / 微软雅黑 / 苹方等）。Docker 镜像缺少中文字体时填容器内字体绝对路径，例如 /usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc。",
+    "default": ""
   },
   "iwara_cookie": {
     "description": "Iwara Cookie 或 Bearer Token",

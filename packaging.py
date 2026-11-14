@@ -32,13 +32,39 @@ _FONT_CANDIDATES = (
     "/usr/share/fonts/opentype/noto/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/noto-cjk/NotoSansCJK-Regular.ttc",
     "/usr/share/fonts/truetype/noto/NotoSansCJK-Regular.ttc",
+    "/usr/share/fonts/opentype/noto/NotoSansSC-Regular.ttf",
+    "/usr/share/fonts/truetype/noto/NotoSansSC-Regular.ttf",
     "/usr/share/fonts/truetype/wqy/wqy-zenhei.ttc",
     "/usr/share/fonts/truetype/wqy/wqy-microhei.ttc",
-    "/usr/share/fonts/truetype/dejavu/DejaVuSans.ttf",
+    "/usr/share/fonts/truetype/droid/DroidSansFallbackFull.ttf",
     # macOS
     "/System/Library/Fonts/PingFang.ttc",
     "/System/Library/Fonts/STHeiti Light.ttc",
 )
+
+_FONT_EXTENSIONS = {".ttf", ".ttc", ".otf"}
+_REQUIRED_CJK_CHARS = ("作", "者", "页", "链")
+_BONUS_CJK_CHARS = ("の", "訳", "☆")
+_PREFERRED_FONT_HINTS = (
+    "noto",
+    "cjk",
+    "sc",
+    "tc",
+    "jp",
+    "wqy",
+    "droid",
+    "msyh",
+    "sim",
+    "pingfang",
+    "heiti",
+    "song",
+    "hy",
+)
+_FONT_UNSET = object()
+_CACHED_CJK_FONT_PATH: str | None | object = _FONT_UNSET
+_FONT_OBJECT_CACHE: dict[tuple[str, int], object] = {}
+_FONT_MISSING_WARNED = False
+_FONT_WARNED_PATHS: set[str] = set()
 
 
 def temp_root() -> Path:
@@ -288,16 +314,223 @@ def repack_image_dir_flat(source_dir: str, title: str) -> GalleryDownload:
     return images_to_zip(image_paths, title)
 
 
-def _find_font(size: int):
+def reset_font_cache() -> None:
+    global _CACHED_CJK_FONT_PATH, _FONT_MISSING_WARNED
+    _CACHED_CJK_FONT_PATH = _FONT_UNSET
+    _FONT_MISSING_WARNED = False
+    _FONT_WARNED_PATHS.clear()
+    _FONT_OBJECT_CACHE.clear()
+
+
+def _font_cjk_score(font) -> int:
+    """检查字体对中文/日文字符的覆盖程度，缺失核心中文字符时返回 0。
+
+    DejaVuSans / Liberation / NotoMono 这类纯西文字体在缺少汉字时会退化成
+    .notdef 方块，Pillow 的 getmask 能画出非空 bbox，因此不能只看 bbox，
+    必须与 .notdef(U+FFFF)的位图做对比。
+    """
+    try:
+        missing_mask = bytes(font.getmask("\uffff"))
+    except Exception:
+        return 0
+
+    def _has_glyph(ch: str) -> bool:
+        try:
+            mask = font.getmask(ch)
+            return mask.getbbox() is not None and bytes(mask) != missing_mask
+        except Exception:
+            return False
+
+    for ch in _REQUIRED_CJK_CHARS:
+        if not _has_glyph(ch):
+            return 0
+    return len(_REQUIRED_CJK_CHARS) + sum(1 for ch in _BONUS_CJK_CHARS if _has_glyph(ch))
+
+
+def _score_font_path(path: Path, size: int = 20) -> int:
     from PIL import ImageFont
 
-    for candidate in _FONT_CANDIDATES:
-        if os.path.exists(candidate):
+    try:
+        font = ImageFont.truetype(str(path), size=size)
+    except Exception:
+        return 0
+    return _font_cjk_score(font)
+
+
+def _warn_font_path_once(key: str, message: str) -> None:
+    """同一路径只告警一次，避免每张卡片刷屏。"""
+    if key in _FONT_WARNED_PATHS:
+        return
+    _FONT_WARNED_PATHS.add(key)
+    logger.warning(message)
+
+
+def _font_name_priority(path: Path) -> tuple[int, str]:
+    lower = path.name.lower()
+    for idx, hint in enumerate(_PREFERRED_FONT_HINTS):
+        if hint in lower:
+            return (idx, lower)
+    return (len(_PREFERRED_FONT_HINTS), lower)
+
+
+def _env_font_paths() -> list[Path]:
+    """SEARCHMANGA_FONT_PATH 可指定字体文件或目录（Windows 用 ; 分隔）。"""
+    raw = os.environ.get("SEARCHMANGA_FONT_PATH", "").strip()
+    if not raw:
+        return []
+    paths: list[Path] = []
+    for part in re.split(r"[;\n]", raw):
+        part = part.strip().strip('"')
+        if not part:
+            continue
+        probe = Path(part).expanduser()
+        if probe.is_dir():
             try:
-                return ImageFont.truetype(candidate, size=size)
-            except Exception:
+                paths.extend(
+                    p for p in sorted(probe.iterdir(), key=_font_name_priority)
+                    if p.is_file() and p.suffix.lower() in _FONT_EXTENSIONS
+                )
+            except OSError:
                 continue
-    return None
+        elif probe.is_file():
+            paths.append(probe)
+    return paths
+
+
+def _iter_cjk_font_paths(preferred: str | None = None) -> list[Path]:
+    seen: set[Path] = set()
+    candidates: list[Path] = []
+
+    def _add(p: Path) -> None:
+        if p.suffix.lower() not in _FONT_EXTENSIONS:
+            return
+        try:
+            resolved = p.resolve()
+        except OSError:
+            resolved = p
+        if resolved not in seen and p.is_file():
+            seen.add(resolved)
+            candidates.append(p)
+
+    if preferred:
+        _add(Path(preferred).expanduser())
+    for p in _env_font_paths():
+        _add(p)
+    for raw in _FONT_CANDIDATES:
+        _add(Path(raw))
+
+    plugin_root = Path(__file__).resolve().parent
+    for local_dir in (plugin_root / "data" / "fonts", temp_root() / "fonts"):
+        if local_dir.is_dir():
+            for p in sorted(local_dir.iterdir(), key=_font_name_priority):
+                _add(p)
+
+    for sys_dir in (
+        Path("/usr/share/fonts"),
+        Path("/usr/local/share/fonts"),
+        Path.home() / ".local" / "share" / "fonts",
+        Path("C:/Windows/Fonts"),
+        Path("/System/Library/Fonts"),
+        Path("/Library/Fonts"),
+    ):
+        if sys_dir.is_dir():
+            try:
+                found = [
+                    p for p in sys_dir.rglob("*")
+                    if p.is_file() and p.suffix.lower() in _FONT_EXTENSIONS
+                ]
+            except OSError:
+                continue
+            for p in sorted(found, key=_font_name_priority):
+                _add(p)
+
+    plugins_dir = plugin_root.parent
+    if plugins_dir.name == "plugins" and plugins_dir.is_dir():
+        plugin_fonts: list[Path] = []
+        sub_dirs = ("", "fonts", "font", "resource", "resources", "core/resources", "ziti")
+        try:
+            subdirs = [d for d in plugins_dir.iterdir() if d.is_dir() and d != plugin_root]
+        except OSError:
+            subdirs = []
+        for plugin_dir in subdirs:
+            for rel in sub_dirs:
+                target_dir = plugin_dir / rel if rel else plugin_dir
+                if not target_dir.is_dir():
+                    continue
+                try:
+                    for item in target_dir.iterdir():
+                        if item.is_file() and item.suffix.lower() in _FONT_EXTENSIONS:
+                            plugin_fonts.append(item)
+                except OSError:
+                    continue
+        for p in sorted(plugin_fonts, key=_font_name_priority):
+            _add(p)
+
+    return candidates
+
+
+def _resolve_cjk_font_path(preferred: str | None = None, use_cache: bool = True) -> str | None:
+    """挑一个真正含中文/日文字形的字体，避免把中文渲染成方块。"""
+    global _CACHED_CJK_FONT_PATH, _FONT_MISSING_WARNED
+
+    if preferred:
+        probe = Path(preferred).expanduser()
+        if probe.is_file() and probe.suffix.lower() in _FONT_EXTENSIONS:
+            if _score_font_path(probe) > 0:
+                return str(probe)
+            _warn_font_path_once(f"{probe}", f"[搜本子] 配置的卡片字体缺少中文/日文字形，已忽略: {probe}")
+        else:
+            _warn_font_path_once(
+                f"missing:{probe}",
+                f"[搜本子] 配置的卡片字体不存在或格式不支持: {probe}",
+            )
+
+    if use_cache and _CACHED_CJK_FONT_PATH is not _FONT_UNSET:
+        return _CACHED_CJK_FONT_PATH  # type: ignore[return-value]
+
+    required = len(_REQUIRED_CJK_CHARS)
+    best_path: str | None = None
+    best_score = 0
+
+    for cand in _iter_cjk_font_paths(preferred):
+        score = _score_font_path(cand)
+        if score > best_score:
+            best_score = score
+            best_path = str(cand)
+            if score >= required:
+                break
+
+    if best_path is None and not _FONT_MISSING_WARNED:
+        _FONT_MISSING_WARNED = True
+        logger.warning(
+            "[搜本子] 未找到含中文/日文字形的字体，信息卡片将回退为纯文本。"
+            "Docker 部署可在镜像里安装 fonts-noto-cjk，"
+            "或把字体挂载到 /usr/share/fonts，"
+            "也可用 card_font_path / 环境变量 SEARCHMANGA_FONT_PATH 指定字体文件。"
+        )
+
+    if use_cache:
+        _CACHED_CJK_FONT_PATH = best_path
+    return best_path
+
+
+def _find_font(size: int, font_path: str | None = None):
+    from PIL import ImageFont
+
+    resolved = _resolve_cjk_font_path(font_path, use_cache=True)
+    if not resolved:
+        return None
+    cache_key = (resolved, size)
+    cached = _FONT_OBJECT_CACHE.get(cache_key)
+    if cached is not None:
+        return cached
+    try:
+        font = ImageFont.truetype(resolved, size=size)
+    except Exception:
+        reset_font_cache()
+        return None
+    _FONT_OBJECT_CACHE[cache_key] = font
+    return font
 
 
 def _wrap_lines(text: str, font: object, max_width: int, max_lines: int = 10) -> list[str]:
@@ -332,6 +565,7 @@ def render_info_card(
     media: ParsedMedia,
     *,
     nsfw_policy: str = "send",
+    font_path: str | None = None,
 ) -> Path | None:
     """使用 Pillow 渲染简洁的信息卡片，缺字体或渲染失败时返回 None 以回退文本。"""
     try:
@@ -339,9 +573,9 @@ def render_info_card(
     except ImportError:
         return None
 
-    title_font = _find_font(28)
-    body_font = _find_font(20)
-    badge_font = _find_font(18)
+    title_font = _find_font(28, font_path)
+    body_font = _find_font(20, font_path)
+    badge_font = _find_font(18, font_path)
     if title_font is None or body_font is None or badge_font is None:
         return None
 
@@ -370,7 +604,7 @@ def render_info_card(
     meta_parts: list[str] = []
     if media.author:
         meta_parts.append(f"作者: {media.author}")
-    if media.page_count:
+    if media.page_count and "页数:" not in (media.extra_info or "") and "页数：" not in (media.extra_info or ""):
         meta_parts.append(f"页数: {media.page_count}")
     if media.summary:
         meta_parts.append(media.summary)
